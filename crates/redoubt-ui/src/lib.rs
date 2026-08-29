@@ -469,6 +469,76 @@ fn handle(app: &Arc<App>, request: &mut tiny_http::Request) -> tiny_http::Respon
             }
         }
 
+        // ── maintenance ──────────────────────────────────────────────
+        (Method::Get, "/api/optimize/analyze") => json_response(
+            serde_json::to_value(redoubt_optimize::cleanup::analyze()).unwrap_or(json!([])),
+            200,
+        ),
+
+        (Method::Post, "/api/optimize/clean") => {
+            let body = read_body(request);
+            let ids: Vec<String> = body
+                .get("ids")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            // The page always previews before it commits, so this defaults to
+            // a dry run: a malformed request must not delete anything.
+            let dry_run = body.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(true);
+
+            if ids.is_empty() {
+                return json_response(json!({ "error": "no categories selected" }), 400);
+            }
+
+            let categories = redoubt_optimize::cleanup::categories();
+            let mut results = Vec::new();
+            for id in &ids {
+                let Some(cat) = categories.iter().find(|c| &c.id == id) else {
+                    continue;
+                };
+                results.push(redoubt_optimize::cleanup::clean(cat, dry_run));
+            }
+            let freed: u64 = results.iter().map(|r| r.bytes_freed).sum();
+            let removed: u64 = results.iter().map(|r| r.files_removed).sum();
+            let skipped: u64 = results.iter().map(|r| r.files_skipped).sum();
+            json_response(
+                json!({
+                    "dry_run": dry_run,
+                    "bytes_freed": freed,
+                    "files_removed": removed,
+                    "files_skipped": skipped,
+                    "results": results,
+                }),
+                200,
+            )
+        }
+
+        (Method::Get, "/api/startup") => json_response(
+            serde_json::to_value(redoubt_optimize::startup::entries()).unwrap_or(json!([])),
+            200,
+        ),
+
+        (Method::Post, "/api/startup/toggle") => {
+            let body = read_body(request);
+            let Some(id) = body.get("id").and_then(|v| v.as_str()) else {
+                return json_response(json!({ "error": "no id given" }), 400);
+            };
+            let enable = body.get("enable").and_then(|v| v.as_bool()).unwrap_or(false);
+            let outcome = if enable {
+                redoubt_optimize::startup::enable(id)
+            } else {
+                redoubt_optimize::startup::disable(id)
+            };
+            match outcome {
+                Ok(()) => json_response(
+                    serde_json::to_value(redoubt_optimize::startup::entries())
+                        .unwrap_or(json!([])),
+                    200,
+                ),
+                Err(e) => json_response(json!({ "error": format!("{e:#}") }), 400),
+            }
+        }
+
         (Method::Post, "/api/realtime/start") => match app.protection() {
             Some(p) => match p.start() {
                 Ok(()) => json_response(

@@ -110,10 +110,14 @@ const PAGES = {
   scan: ["Scan", "Check a folder or drive on demand"],
   findings: ["Findings", "Everything detected so far"],
   signatures: ["Signatures", "What is loaded, and what is not"],
+  maintenance: ["Maintenance", "Reclaim space and control what starts with Windows"],
   settings: ["Settings", "Engines, heuristics and enforcement"],
 };
 
 function goto(page) {
+  if (page === "maintenance" && !CLEANUP.length) {
+    loadMaintenance();
+  }
   $$("section[data-page]").forEach((s) =>
     s.classList.toggle("hidden", s.dataset.page !== page),
   );
@@ -435,6 +439,119 @@ function showDetail(v) {
   $("#detail-modal").showModal();
 }
 
+/* ─────────────────────────────  maintenance  ───────────────────────────── */
+
+let CLEANUP = [];
+let STARTUP = [];
+const CLEAN_SELECTED = new Set();
+
+function renderCleanup() {
+  if (!CLEANUP.length) {
+    $("#cleanup-list").innerHTML =
+      '<p class="py-6 text-center text-sm opacity-60">Nothing reclaimable found.</p>';
+    return;
+  }
+
+  const rows = CLEANUP.map((c) => {
+    const blocked = c.needs_admin && c.bytes === 0 && c.unreadable > 0;
+    return `
+      <tr class="${blocked ? "opacity-50" : ""}">
+        <td class="w-10">
+          <input type="checkbox" class="checkbox checkbox-sm" data-clean="${esc(c.id)}"
+                 ${CLEAN_SELECTED.has(c.id) ? "checked" : ""} ${blocked ? "disabled" : ""} />
+        </td>
+        <td>
+          <div class="flex flex-wrap items-center gap-2">
+            <span class="font-medium">${esc(c.name)}</span>
+            ${c.safety === "caution" ? '<span class="badge badge-soft badge-warning badge-xs">has a cost</span>' : ""}
+            ${c.needs_admin ? '<span class="badge badge-ghost badge-xs">needs admin</span>' : ""}
+          </div>
+          <p class="mt-0.5 text-xs opacity-60">${esc(c.description)}</p>
+          ${
+            c.unreadable > 0
+              ? `<p class="mt-0.5 text-xs opacity-45">${num(c.unreadable)} item(s) could not be read${c.needs_admin ? " without elevation" : ""}</p>`
+              : ""
+          }
+        </td>
+        <td class="tnum text-right whitespace-nowrap">${bytes(c.bytes)}</td>
+        <td class="tnum text-right whitespace-nowrap opacity-60">${num(c.files)}</td>
+      </tr>`;
+  }).join("");
+
+  $("#cleanup-list").innerHTML = `
+    <table class="table table-sm">
+      <thead><tr>
+        <th></th><th>Category</th><th class="text-right">Size</th><th class="text-right">Files</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+  updateCleanTotal();
+}
+
+function updateCleanTotal() {
+  const total = CLEANUP.filter((c) => CLEAN_SELECTED.has(c.id)).reduce(
+    (a, c) => a + c.bytes,
+    0,
+  );
+  $("#clean-selected-size").textContent = total ? bytes(total) : "—";
+  $("#btn-clean").disabled = total === 0;
+}
+
+function renderStartup() {
+  if (!STARTUP.length) {
+    $("#startup-list").innerHTML =
+      '<p class="py-6 text-center text-sm opacity-60">Nothing starts with Windows.</p>';
+    $("#startup-count").textContent = "";
+    return;
+  }
+
+  const enabled = STARTUP.filter((e) => e.enabled).length;
+  $("#startup-count").textContent = `${enabled} of ${STARTUP.length} enabled`;
+
+  const rows = STARTUP.map(
+    (e) => `
+      <tr>
+        <td>
+          <div class="font-medium">${esc(e.name)}</div>
+          <div class="truncate font-mono text-xs opacity-55" title="${esc(e.command)}">${esc(e.image ?? e.command)}</div>
+        </td>
+        <td class="whitespace-nowrap text-xs opacity-70">${esc(e.source_label)}</td>
+        <td class="w-16 text-right">
+          <input type="checkbox" class="toggle toggle-sm" data-startup="${esc(e.id)}"
+                 ${e.enabled ? "checked" : ""} aria-label="Toggle ${esc(e.name)}" />
+        </td>
+      </tr>`,
+  ).join("");
+
+  $("#startup-list").innerHTML = `
+    <table class="table table-sm">
+      <colgroup><col /><col style="width:14rem" /><col style="width:5rem" /></colgroup>
+      <thead><tr><th>Program</th><th>Source</th><th class="text-right">On</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+async function loadMaintenance() {
+  try {
+    const [clean, startup] = await Promise.all([
+      api.get("/api/optimize/analyze"),
+      api.get("/api/startup"),
+    ]);
+    CLEANUP = clean;
+    STARTUP = startup;
+    // Preselect only what the engine marks safe and default.
+    if (CLEAN_SELECTED.size === 0) {
+      for (const c of CLEANUP) {
+        if (c.default_selected && c.bytes > 0) CLEAN_SELECTED.add(c.id);
+      }
+    }
+    renderCleanup();
+    renderStartup();
+  } catch (e) {
+    toast(`Could not read maintenance data: ${e.message}`, "error");
+  }
+}
+
 /* ─────────────────────────────  settings  ───────────────────────────── */
 
 const ENGINE_LABELS = {
@@ -677,6 +794,75 @@ function wire() {
   $("#btn-update-all").addEventListener("click", () =>
     startJob("/api/db/update", {}, "Updating signatures…"),
   );
+
+  // Cleanup selection
+  document.addEventListener("change", (ev) => {
+    const box = ev.target.closest("[data-clean]");
+    if (!box) return;
+    if (box.checked) CLEAN_SELECTED.add(box.dataset.clean);
+    else CLEAN_SELECTED.delete(box.dataset.clean);
+    updateCleanTotal();
+  });
+
+  $("#btn-clean").addEventListener("click", async () => {
+    const ids = [...CLEAN_SELECTED];
+    if (!ids.length) return;
+
+    // Preview first, then confirm with the real number. The measurement can
+    // have moved since the page loaded.
+    let preview;
+    try {
+      preview = await api.post("/api/optimize/clean", { ids, dry_run: true });
+    } catch (e) {
+      toast(e.message, "error");
+      return;
+    }
+    if (preview.files_removed === 0) {
+      toast("Nothing left to remove", "info");
+      await loadMaintenance();
+      return;
+    }
+    if (
+      !confirm(
+        `Remove ${nf.format(preview.files_removed)} file(s), freeing ${bytes(preview.bytes_freed)}?\n\n` +
+          ids.join(", "),
+      )
+    ) {
+      return;
+    }
+
+    busy(true, "Cleaning up…");
+    try {
+      const r = await api.post("/api/optimize/clean", { ids, dry_run: false });
+      toast(
+        `Freed ${bytes(r.bytes_freed)} across ${nf.format(r.files_removed)} file(s)` +
+          (r.files_skipped ? `; ${nf.format(r.files_skipped)} in use` : ""),
+        "success",
+      );
+      CLEAN_SELECTED.clear();
+      await loadMaintenance();
+    } catch (e) {
+      toast(e.message, "error");
+    } finally {
+      busy(false);
+    }
+  });
+
+  // Startup toggles
+  document.addEventListener("change", async (ev) => {
+    const toggle = ev.target.closest("[data-startup]");
+    if (!toggle) return;
+    const id = toggle.dataset.startup;
+    const enable = toggle.checked;
+    try {
+      STARTUP = await api.post("/api/startup/toggle", { id, enable });
+      renderStartup();
+      toast(enable ? "Enabled at startup" : "Disabled at startup", "success");
+    } catch (e) {
+      toggle.checked = !enable;
+      toast(e.message, "error");
+    }
+  });
 
   $("#rt-toggle").addEventListener("change", async (ev) => {
     const on = ev.target.checked;

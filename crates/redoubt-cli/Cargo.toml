@@ -21,3 +21,4 @@ toml.workspace = true
 rayon.workspace = true
 walkdir.workspace = true
 redoubt-ui = { version = "0.1.0", path = "../redoubt-ui" }
+redoubt-optimize = { version = "0.1.0", path = "../redoubt-optimize" }

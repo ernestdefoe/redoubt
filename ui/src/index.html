@@ -282,6 +282,65 @@
         </div>
       </section>
 
+
+      <!-- ══════════════════  MAINTENANCE  ══════════════════ -->
+      <section data-page="maintenance" class="mx-auto hidden max-w-6xl space-y-5">
+
+        <div class="card card-border bg-base-100">
+          <div class="card-body gap-4">
+            <div class="flex flex-wrap items-start justify-between gap-4">
+              <div>
+                <h2 class="card-title text-base">Reclaim space</h2>
+                <p class="mt-0.5 text-sm opacity-70">
+                  Measured, not estimated. Nothing is removed until you confirm.
+                </p>
+              </div>
+              <div class="flex items-center gap-3">
+                <div class="text-right">
+                  <div class="tnum text-2xl font-semibold" id="clean-selected-size">—</div>
+                  <div class="text-xs opacity-60">selected</div>
+                </div>
+                <button id="btn-clean" class="btn btn-primary">Clean up</button>
+              </div>
+            </div>
+
+            <div id="cleanup-list" class="overflow-x-auto">
+              <p class="py-6 text-center text-sm opacity-60">
+                <span class="loading loading-spinner loading-sm align-middle"></span>
+                measuring…
+              </p>
+            </div>
+
+            <div role="alert" class="alert alert-soft items-start text-sm">
+              <svg class="size-5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="9" /><path d="M12 16v-5m0-3h.01" />
+              </svg>
+              <span>
+                Prefetch and the WinSxS component store are deliberately not offered. Clearing
+                Prefetch makes application launch slower until Windows rebuilds it, and deleting
+                from WinSxS by hand breaks Windows servicing permanently.
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <div class="card card-border bg-base-100">
+          <div class="card-body gap-3">
+            <div class="flex flex-wrap items-baseline justify-between gap-3">
+              <div>
+                <h2 class="card-title text-base">Starts with Windows</h2>
+                <p class="mt-0.5 text-sm opacity-70">
+                  Turning an entry off moves it aside rather than deleting it, so it can always
+                  be turned back on.
+                </p>
+              </div>
+              <span class="text-sm opacity-60" id="startup-count"></span>
+            </div>
+            <div id="startup-list" class="overflow-x-auto"></div>
+          </div>
+        </div>
+      </section>
+
       <!-- ══════════════════  SETTINGS  ══════════════════ -->
       <section data-page="settings" class="mx-auto hidden max-w-6xl space-y-5">
 
@@ -395,6 +454,14 @@
               <path d="M4 12c0 1.5 3.6 2.8 8 2.8s8-1.3 8-2.8" />
             </svg>
             Signatures
+          </button>
+        </li>
+        <li>
+          <button data-goto="maintenance">
+            <svg class="size-4.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M14.7 6.3a4 4 0 0 1-5.4 5.4L4 17v3h3l5.3-5.3a4 4 0 0 1 5.4-5.4l-2.3 2.3 2 2 2.3-2.3a4 4 0 0 1-5 -5Z" />
+            </svg>
+            Maintenance
           </button>
         </li>
         <li>

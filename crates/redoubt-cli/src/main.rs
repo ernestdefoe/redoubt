@@ -65,6 +65,10 @@ enum Command {
         show_skipped: bool,
     },
 
+    /// Reclaim disk space and manage what starts with Windows.
+    #[command(subcommand)]
+    Optimize(OptimizeCommand),
+
     /// Open the Redoubt interface.
     Ui {
         /// Port to bind on loopback. 0 picks a free one.
@@ -78,6 +82,32 @@ enum Command {
 
     /// Show resolved configuration and where everything lives.
     Config,
+}
+
+#[derive(Subcommand)]
+enum OptimizeCommand {
+    /// Measure reclaimable space. Changes nothing.
+    Analyze,
+    /// Remove the contents of one or more categories.
+    Clean {
+        /// Category ids, or `--all-safe` for every category marked safe.
+        ids: Vec<String>,
+        /// Every category whose removal has no lasting effect.
+        #[arg(long)]
+        all_safe: bool,
+        /// Report what would go without removing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// List what starts with Windows.
+    Startup {
+        /// Turn an entry off, keeping everything needed to turn it back on.
+        #[arg(long, value_name = "ID")]
+        disable: Option<String>,
+        /// Turn a previously disabled entry back on.
+        #[arg(long, value_name = "ID")]
+        enable: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -120,6 +150,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Db(cmd) => run_db(&cfg, cmd),
         Command::Rules(cmd) => run_rules(&cfg, cmd),
+        Command::Optimize(cmd) => run_optimize(cmd),
         Command::Ui { port, no_open } => {
             let path = cli
                 .config
@@ -158,6 +189,149 @@ fn main() -> Result<()> {
             println!("# config file: {}", redoubt_core::config::default_config_path().display());
             Ok(())
         }
+    }
+}
+
+fn run_optimize(cmd: OptimizeCommand) -> Result<()> {
+    use redoubt_optimize::{cleanup, startup};
+
+    match cmd {
+        OptimizeCommand::Analyze => {
+            let results = cleanup::analyze();
+            if results.is_empty() {
+                println!("nothing reclaimable found");
+                return Ok(());
+            }
+            println!(
+                "{:<22} {:>11} {:>9}  {:<8} {}",
+                "CATEGORY", "SIZE", "FILES", "SAFETY", "ID"
+            );
+            let mut total = 0u64;
+            for r in &results {
+                total += r.bytes;
+                println!(
+                    "{:<22} {:>11} {:>9}  {:<8} {}{}",
+                    truncate(&r.name, 22),
+                    human_bytes(r.bytes),
+                    commas(r.files),
+                    format!("{:?}", r.safety).to_lowercase(),
+                    r.id,
+                    if r.needs_admin { "  (needs admin)" } else { "" },
+                );
+            }
+            println!("{:<22} {:>11}  total", "", human_bytes(total));
+            println!(
+                "\nPrefetch and the WinSxS component store are deliberately not offered."
+            );
+            Ok(())
+        }
+
+        OptimizeCommand::Clean { ids, all_safe, dry_run } => {
+            let categories = cleanup::categories();
+            let chosen: Vec<_> = if all_safe {
+                categories
+                    .iter()
+                    .filter(|c| c.safety == cleanup::Safety::Safe)
+                    .collect()
+            } else {
+                categories.iter().filter(|c| ids.contains(&c.id)).collect()
+            };
+
+            if chosen.is_empty() {
+                anyhow::bail!(
+                    "no categories selected - run `redoubt optimize analyze` to see the ids,                      or pass --all-safe"
+                );
+            }
+
+            let mut freed = 0u64;
+            let mut removed = 0u64;
+            let mut skipped = 0u64;
+            for cat in chosen {
+                let r = cleanup::clean(cat, dry_run);
+                println!(
+                    "  {:<22} {:>11}  {:>8} file(s){}",
+                    truncate(&cat.name, 22),
+                    human_bytes(r.bytes_freed),
+                    commas(r.files_removed),
+                    if r.files_skipped > 0 {
+                        format!("  ({} in use)", commas(r.files_skipped))
+                    } else {
+                        String::new()
+                    },
+                );
+                if r.refused > 0 {
+                    // Never silent: a refusal means a path escaped its root,
+                    // which is a bug rather than a condition.
+                    println!("    WARNING: {} path(s) refused by the containment check", r.refused);
+                }
+                freed += r.bytes_freed;
+                removed += r.files_removed;
+                skipped += r.files_skipped;
+            }
+
+            println!(
+                "\n{} {} across {} file(s){}",
+                if dry_run { "would free" } else { "freed" },
+                human_bytes(freed),
+                commas(removed),
+                if skipped > 0 { format!("; {} in use", commas(skipped)) } else { String::new() },
+            );
+            if dry_run {
+                println!("(dry run - nothing was removed)");
+            }
+            Ok(())
+        }
+
+        OptimizeCommand::Startup { disable, enable } => {
+            if let Some(id) = disable {
+                startup::disable(&id).with_context(|| format!("disabling {id}"))?;
+                println!("disabled {id}");
+            }
+            if let Some(id) = enable {
+                startup::enable(&id).with_context(|| format!("enabling {id}"))?;
+                println!("enabled {id}");
+            }
+
+            let entries = startup::entries();
+            let on = entries.iter().filter(|e| e.enabled).count();
+            println!("{on} of {} enabled\n", entries.len());
+            println!("{:<4} {:<30} {:<28} {}", "ON", "PROGRAM", "SOURCE", "ID");
+            for e in &entries {
+                println!(
+                    "{:<4} {:<30} {:<28} {}",
+                    if e.enabled { "yes" } else { "no" },
+                    truncate(&e.name, 30),
+                    e.source_label,
+                    e.id,
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(n.saturating_sub(1)).collect();
+        out.push('\u{2026}');
+        out
+    }
+}
+
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", UNITS[i])
     }
 }
 

@@ -117,6 +117,14 @@ if (SCAN_PATH) {
   await shot("02-scan-ready", "scan page");
 }
 
+await goto("maintenance");
+// The measurement walks several large directories; wait for it to land.
+await page.waitForFunction(
+  () => !document.querySelector("#cleanup-list")?.textContent.includes("measuring"),
+  { timeout: 120000 },
+);
+await shot("05b-maintenance", "reclaimable space and startup entries");
+
 await goto("signatures");
 await shot("06-signatures", "sources and coverage gaps");
 
