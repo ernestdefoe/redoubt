@@ -456,6 +456,11 @@ fn handle(app: &Arc<App>, request: &mut tiny_http::Request) -> tiny_http::Respon
                     cfg.heuristics = h;
                 }
             }
+            if let Some(r) = patch.get("ransomware") {
+                if let Ok(r) = serde_json::from_value(r.clone()) {
+                    cfg.ransomware = r;
+                }
+            }
             let saved = cfg.save(&app.config_path);
             let cfg = cfg.clone();
             drop(app.cfg.write());

@@ -54,6 +54,22 @@
       </div>
     </header>
 
+    <!-- Ransomware banner. Sits above every page: an alert nobody sees is
+         worth nothing, and this is the one event where seconds matter. -->
+    <div id="ransom-banner" class="hidden border-b border-error/30 bg-error/10 px-4 py-3 lg:px-6">
+      <div class="mx-auto flex max-w-6xl items-start gap-3">
+        <svg class="mt-0.5 size-6 shrink-0 text-error" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 9v4m0 4h.01M10.3 3.9 2.4 17.2A2 2 0 0 0 4.1 20.2h15.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" />
+        </svg>
+        <div class="min-w-0 flex-1">
+          <p class="font-semibold text-error" id="ransom-title">Something is encrypting files on this machine</p>
+          <ul class="mt-1 space-y-0.5 text-sm" id="ransom-signals"></ul>
+          <p class="mt-2 text-xs opacity-70" id="ransom-limitation"></p>
+        </div>
+        <button id="ransom-dismiss" class="btn btn-sm btn-ghost shrink-0">Dismiss</button>
+      </div>
+    </div>
+
     <main class="flex-1 p-4 lg:p-6">
 
       <!-- ══════════════════  OVERVIEW  ══════════════════ -->
@@ -391,6 +407,29 @@
             <div id="heuristics-list" class="divide-y divide-base-300"></div>
           </div>
         </div>
+        </div>
+
+        <div class="card card-border bg-base-100">
+          <div class="card-body gap-3">
+            <h2 class="card-title text-base">Ransomware</h2>
+            <p class="text-sm opacity-70">
+              Behavioural detection, independent of signatures. Decoy files are placed in the
+              watched folders; nothing legitimate touches them.
+            </p>
+            <div id="ransomware-list" class="divide-y divide-base-300"></div>
+
+            <div role="alert" class="alert alert-soft alert-warning mt-1 items-start text-sm" id="terminate-warning">
+              <svg class="size-5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 9v4m0 4h.01M10.3 3.9 2.4 17.2A2 2 0 0 0 4.1 20.2h15.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" />
+              </svg>
+              <span>
+                Redoubt cannot see which process wrote which file without a driver, so the
+                responsible program is inferred from unusual write activity. Termination only
+                happens when one process is unambiguously ahead of everything else, and it
+                also requires enforcement to be on.
+              </span>
+            </div>
+          </div>
         </div>
 
         <div class="card card-border bg-base-100">

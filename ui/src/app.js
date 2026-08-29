@@ -170,16 +170,34 @@ function renderStatus(s) {
   $("#sig-body").textContent = num(e.body_patterns);
   $("#sig-allow").textContent = num(e.allowlisted);
 
-  // Hero
+  // Hero. It must never read "ready" while a critical alert is on screen -
+  // a reassuring headline above an active incident is worse than no headline.
   const enforcing = s.mode === "enforce";
+  const critical = (s.realtime?.ransomware?.alerts ?? []).some(
+    (a) => a.confidence === "critical" && !dismissedAlerts.has(alertKey(a)),
+  );
+
   $("#hero-mode").textContent = s.mode;
   $("#hero-mode").className = `badge badge-soft badge-sm ${enforcing ? "badge-success" : ""}`;
-  $("#hero-title").textContent = enforcing ? "Enforcing" : "Engine ready";
-  $("#hero-sub").textContent = enforcing
-    ? "Malicious files will be quarantined."
-    : "Detections are reported only. Nothing is quarantined or removed.";
+
+  const icon = $("#hero-icon");
+  if (critical) {
+    $("#hero-title").textContent = "Attack in progress";
+    $("#hero-sub").textContent =
+      "Files are being encrypted. See the alert above before doing anything else.";
+    icon.className =
+      "grid size-14 shrink-0 place-items-center rounded-box bg-error/15 text-error";
+  } else {
+    $("#hero-title").textContent = enforcing ? "Enforcing" : "Engine ready";
+    $("#hero-sub").textContent = enforcing
+      ? "Malicious files will be quarantined."
+      : "Detections are reported only. Nothing is quarantined or removed.";
+    icon.className =
+      "grid size-14 shrink-0 place-items-center rounded-box bg-success/15 text-success";
+  }
 
   renderRealtime(s.realtime);
+  renderRansomBanner(s.realtime.ransomware?.alerts ?? []);
 
   // Presets
   $("#scan-presets").innerHTML = s.presets
@@ -226,6 +244,72 @@ function renderStatus(s) {
   renderGaps(s.gaps);
 }
 
+/** The ransomware banner.
+ *
+ *  Shows the most serious outstanding alert across the whole app. Dismissal is
+ *  per-alert and remembered only for the session: a fresh alert always
+ *  reappears, because suppressing this one permanently would be the single
+ *  worst thing this interface could do. */
+let dismissedAlerts = new Set();
+
+function alertKey(a) {
+  return `${a.at_epoch}:${a.confidence}:${a.signals.length}`;
+}
+
+function renderRansomBanner(alerts) {
+  const live = alerts.filter((a) => !dismissedAlerts.has(alertKey(a)));
+  const banner = $("#ransom-banner");
+  if (!live.length) {
+    banner.classList.add("hidden");
+    return;
+  }
+
+  // Worst first; ties broken by recency.
+  const rank = { critical: 3, high: 2, low: 1 };
+  live.sort(
+    (a, b) => (rank[b.confidence] ?? 0) - (rank[a.confidence] ?? 0) || b.at_epoch - a.at_epoch,
+  );
+  const worst = live[0];
+
+  $("#ransom-title").textContent = worst.summary;
+  $("#ransom-signals").innerHTML = worst.signals
+    .map((s) => `<li>&bull; ${esc(describeSignal(s))}</li>`)
+    .join("");
+
+  const suspects = worst.suspects ?? [];
+  const attribution = suspects.length
+    ? `Most unusual write activity: ${suspects
+        .slice(0, 2)
+        .map((s) => `${esc(s.name)} (${bytes(s.bytes_in_window)})`)
+        .join(", ")}. `
+    : "";
+  $("#ransom-limitation").textContent = attribution + worst.limitation;
+
+  banner.classList.remove("hidden");
+  banner.dataset.key = alertKey(worst);
+}
+
+/** Turn a signal into a sentence. The server sends structured data; the
+ *  wording lives here so the page never shows a bare enum name. */
+function describeSignal(s) {
+  const [kind, v] = Object.entries(s)[0] ?? [];
+  const file = (p) => String(p ?? "").split(/[\\/]/).pop();
+  switch (kind) {
+    case "canary_touched":
+      return `A decoy file was modified or deleted: ${file(v.path)}`;
+    case "ransom_note":
+      return `A file named like a ransom note appeared: ${file(v.path)}`;
+    case "known_extension":
+      return `A file was renamed to .${v.extension}, used by known ransomware: ${file(v.path)}`;
+    case "modification_burst":
+      return `${nf.format(v.files)} files changed in ${v.seconds.toFixed(0)} seconds`;
+    case "entropy_rise":
+      return `A .${v.extension} file now looks random (entropy ${v.entropy.toFixed(2)}): ${file(v.path)}`;
+    default:
+      return kind ?? "unknown signal";
+  }
+}
+
 /** Sidebar real-time panel.
  *
  *  The dot is green only when protection is genuinely running, and the note is
@@ -269,6 +353,11 @@ async function refreshRealtime() {
     const before = RT_FINDINGS.length;
     RT_FINDINGS = found;
     renderRealtime(s.realtime);
+    renderRansomBanner(s.realtime.ransomware?.alerts ?? []);
+    if (STATUS) {
+      STATUS.realtime = s.realtime;
+      renderStatus(STATUS);
+    }
     if (found.length !== before) {
       renderFindings();
       const fresh = found.length - before;
@@ -562,6 +651,13 @@ const ENGINE_LABELS = {
   heuristics: ["Heuristics", "Shape-based signals. Suspicious only, never enforced."],
 };
 
+const RANSOMWARE_LABELS = {
+  enabled: ["Behavioural detection", "Watch for the pattern of files being encrypted."],
+  canaries: ["Decoy files", "Place bait files in watched folders. Nothing legitimate touches them, which makes this the strongest signal available."],
+  attribute_process: ["Identify the process", "Sample process write activity to work out what is responsible."],
+  terminate_on_critical: ["Stop the process automatically", "Only acts when one process is unambiguously responsible, and only with enforcement on. Off by default."],
+};
+
 const HEURISTIC_LABELS = {
   high_entropy: ["High-entropy code", "Executable sections that look packed or encrypted."],
   writable_executable_section: ["Writable + executable section", "Normal for a packer stub, not for a compiler."],
@@ -609,6 +705,17 @@ function renderConfig(cfg) {
       toggleRow(key, label, desc, cfg.heuristics[key], async (on) => {
         cfg.heuristics[key] = on;
         await saveConfig({ heuristics: cfg.heuristics });
+      }),
+    );
+  }
+
+  const ransom = $("#ransomware-list");
+  ransom.innerHTML = "";
+  for (const [key, [label, desc]] of Object.entries(RANSOMWARE_LABELS)) {
+    ransom.appendChild(
+      toggleRow(key, label, desc, cfg.ransomware[key], async (on) => {
+        cfg.ransomware[key] = on;
+        await saveConfig({ ransomware: cfg.ransomware });
       }),
     );
   }
@@ -862,6 +969,12 @@ function wire() {
       toggle.checked = !enable;
       toast(e.message, "error");
     }
+  });
+
+  $("#ransom-dismiss").addEventListener("click", () => {
+    const key = $("#ransom-banner").dataset.key;
+    if (key) dismissedAlerts.add(key);
+    $("#ransom-banner").classList.add("hidden");
   });
 
   $("#rt-toggle").addEventListener("change", async (ev) => {
