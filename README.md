@@ -9,8 +9,9 @@ and watches the places files actually arrive.
 It runs **observe-first**: it detects, logs and reports, and does not quarantine
 anything until you explicitly turn enforcement on.
 
-Free and MIT-licensed. [Download the installer](installer/) or build it
-yourself.
+Free and MIT-licensed.
+**[Download the installer](https://github.com/ernestdefoe/redoubt/releases/latest)**
+or build it yourself.
 
 ## What this is, and what it is not
 
