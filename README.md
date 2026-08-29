@@ -49,7 +49,7 @@ Worth knowing before you install it, so nothing here is a surprise:
 | Real-time protection | **Working** — file watching, detect-and-react |
 | Ransomware detection | **Working** — behavioural, five signals |
 | Process attribution + termination | **Working** — opt-in, two switches |
-| Quarantine + restore | **Working** |
+| Quarantine + restore | **Working** — on demand, from any finding |
 | Desktop interface | **Working** |
 | Disk cleanup + startup manager | **Working** |
 | Windows service registration | **Working** — installer, or `redoubtd install` |
@@ -60,7 +60,7 @@ Worth knowing before you install it, so nothing here is a surprise:
 | Filesystem minifilter (pre-execution blocking) | Not built |
 | Network C2 blocking | **Working** — WFP, no driver needed |
 
-369 tests.
+372 tests.
 
 ---
 

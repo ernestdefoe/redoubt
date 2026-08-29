@@ -109,6 +109,7 @@ const PAGES = {
   overview: ["Overview", "Protection status at a glance"],
   scan: ["Scan", "Check a folder or drive on demand"],
   findings: ["Findings", "Everything detected so far"],
+  quarantine: ["Quarantine", "Files Redoubt is holding, and what to do with them"],
   signatures: ["Signatures", "What is loaded, and what is not"],
   maintenance: ["Maintenance", "Reclaim space and control what starts with Windows"],
   settings: ["Settings", "Engines, heuristics and enforcement"],
@@ -646,6 +647,11 @@ function renderFindings() {
     `${list.length} of ${FINDINGS.length} finding${FINDINGS.length === 1 ? "" : "s"}`;
 
   const mal = FINDINGS.filter((f) => f.severity === "malicious").length;
+  const bulk = $("#btn-quarantine-all");
+  bulk.classList.toggle("hidden", mal === 0);
+  $("#btn-quarantine-all-label").textContent =
+    mal === 1 ? "Quarantine 1 file" : `Quarantine ${mal} files`;
+
   const badge = $("#nav-findings-badge");
   badge.textContent = mal;
   badge.classList.toggle("hidden", mal === 0);
@@ -688,8 +694,183 @@ function showDetail(v) {
       <dt class="opacity-60">Scan time</dt><dd class="tnum">${(v.scan_micros / 1000).toFixed(2)} ms</dd>
       <dt class="opacity-60">SHA-256</dt><dd class="break-all font-mono">${esc(v.identity.sha256 ?? "—")}</dd>
       <dt class="opacity-60">MD5</dt><dd class="break-all font-mono">${esc(v.identity.md5 ?? "—")}</dd>
-    </dl>`;
+    </dl>
+    ${
+      v.severity === "malicious"
+        ? `<button id="detail-quarantine" class="btn btn-error btn-sm w-full gap-1.5">
+             <svg class="size-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+               <rect x="4" y="6" width="16" height="14" rx="2" /><path d="M9 6V4h6v2" />
+             </svg>
+             Quarantine this file
+           </button>`
+        : v.severity === "suspicious"
+          ? `<p class="text-xs opacity-60">
+               Suspicious findings are never quarantined. This describes the shape of the
+               file, not a match against anything known to be malware.
+             </p>`
+          : ""
+    }`;
+
+  const take = $("#detail-quarantine");
+  if (take) {
+    take.addEventListener("click", async () => {
+      take.disabled = true;
+      await quarantinePaths([v.path]);
+      $("#detail-modal").close();
+    });
+  }
+
   $("#detail-modal").showModal();
+}
+
+/* ─────────────────────────────  quarantine  ───────────────────────────── */
+
+let QUARANTINE = [];
+
+/** Move files into quarantine, and say plainly what did not go.
+ *
+ * The service re-scans every path before touching it, so a refusal here is a
+ * real answer about the file rather than a failure - it is worth showing, not
+ * swallowing.
+ */
+async function quarantinePaths(paths) {
+  try {
+    const r = await api.post("/api/quarantine/take", { paths });
+    const took = r.taken?.length ?? 0;
+    const refused = r.refused ?? [];
+
+    if (took > 0) {
+      toast(
+        `${took} file${took === 1 ? "" : "s"} quarantined`,
+        "success",
+      );
+    }
+    for (const item of refused.slice(0, 3)) {
+      toast(`${item.path.split(/[\\/]/).pop()}: ${item.why}`, "warning");
+    }
+    if (refused.length > 3) {
+      toast(`${refused.length - 3} more could not be quarantined`, "warning");
+    }
+    if (took === 0 && refused.length === 0) {
+      toast("Nothing was quarantined", "warning");
+    }
+
+    // The files are gone from where they were, so the findings list is now
+    // describing paths that no longer hold what it says they do.
+    SCAN_FINDINGS = SCAN_FINDINGS.filter((f) => !paths.includes(f.path));
+    RT_FINDINGS = RT_FINDINGS.filter((f) => !paths.includes(f.path));
+    renderFindings();
+    await loadQuarantine();
+  } catch (e) {
+    toast(e.message, "error");
+  }
+}
+
+async function loadQuarantine() {
+  try {
+    QUARANTINE = await api.get("/api/quarantine");
+  } catch {
+    QUARANTINE = [];
+  }
+  renderQuarantine();
+}
+
+function renderQuarantine() {
+  const badge = $("#nav-quarantine-badge");
+  badge.textContent = QUARANTINE.length;
+  badge.classList.toggle("hidden", QUARANTINE.length === 0);
+  $("#quarantine-count").textContent =
+    `${QUARANTINE.length} file${QUARANTINE.length === 1 ? "" : "s"} held`;
+
+  if (!QUARANTINE.length) {
+    $("#quarantine-table").innerHTML =
+      '<p class="py-6 text-center text-sm opacity-60">Nothing is quarantined.</p>';
+    return;
+  }
+
+  $("#quarantine-table").innerHTML = `
+    <table class="table table-sm">
+      <thead><tr>
+        <th>File</th><th>Detected as</th><th class="text-right">Size</th><th></th>
+      </tr></thead>
+      <tbody>
+        ${QUARANTINE.map(
+          (e) => `
+          <tr>
+            <td class="max-w-0">
+              <div class="truncate font-medium">${esc(e.original_path.split(/[\\/]/).pop())}</div>
+              <div class="truncate text-xs opacity-55">${esc(e.original_path)}</div>
+            </td>
+            <td class="max-w-0"><div class="truncate font-mono text-xs">${esc(
+              e.detections?.[0]?.name ?? "—",
+            )}</div></td>
+            <td class="tnum text-right text-xs opacity-70">${num(e.size ?? 0)}</td>
+            <td class="text-right whitespace-nowrap">
+              <button class="btn btn-ghost btn-xs" data-restore="${esc(e.id)}">Restore</button>
+              <button class="btn btn-ghost btn-xs text-error" data-purge="${esc(e.id)}">Delete</button>
+            </td>
+          </tr>`,
+        ).join("")}
+      </tbody>
+    </table>`;
+
+  $("#quarantine-table").querySelectorAll("[data-restore]").forEach((b) =>
+    b.addEventListener("click", () => restoreHeld(b.dataset.restore)),
+  );
+  $("#quarantine-table").querySelectorAll("[data-purge]").forEach((b) =>
+    b.addEventListener("click", () => purgeHeld(b.dataset.purge)),
+  );
+}
+
+async function restoreHeld(id) {
+  const entry = QUARANTINE.find((e) => e.id === id);
+  if (
+    !confirm(
+      `Put this file back where it came from?
+
+${entry?.original_path ?? id}
+
+` +
+        `Redoubt detected it as ${entry?.detections?.[0]?.name ?? "malicious"}. ` +
+        `Restoring makes it ` +
+        `runnable again.`,
+    )
+  ) {
+    return;
+  }
+  try {
+    const r = await api.post("/api/quarantine/restore", { id });
+    toast(`Restored to ${r.restored}`, "success");
+    await loadQuarantine();
+  } catch (e) {
+    toast(e.message, "error");
+  }
+}
+
+async function purgeHeld(id) {
+  const entry = QUARANTINE.find((e) => e.id === id);
+  // Deliberately blunt, and deliberately not a toast-and-undo: there is no
+  // undo. The file is destroyed.
+  if (
+    !confirm(
+      `Delete this file permanently?
+
+${entry?.original_path ?? id}
+
+` +
+        `This cannot be undone. If you are not sure, leave it here — a ` +
+        `quarantined file is already harmless.`,
+    )
+  ) {
+    return;
+  }
+  try {
+    await api.post("/api/quarantine/delete", { id });
+    toast("Deleted permanently", "success");
+    await loadQuarantine();
+  } catch (e) {
+    toast(e.message, "error");
+  }
 }
 
 /* ─────────────────────────────  maintenance  ───────────────────────────── */
@@ -1012,6 +1193,7 @@ async function refresh() {
     renderConfig(cfg);
     renderFindings();
     renderSetup(status, svc);
+    await loadQuarantine();
   } catch (e) {
     toast(`Cannot reach the Redoubt service: ${e.message}`, "error");
   }
@@ -1140,6 +1322,27 @@ function wire() {
       toggle.checked = !enable;
       toast(e.message, "error");
     }
+  });
+
+  $("#btn-quarantine-all").addEventListener("click", async () => {
+    const mal = FINDINGS.filter((f) => f.severity === "malicious");
+    if (!mal.length) return;
+    if (
+      !confirm(
+        `Quarantine ${mal.length} file${mal.length === 1 ? "" : "s"}?
+
+` +
+          `Each one is re-scanned first, and only moved if it is still ` +
+          `malicious. Nothing is deleted — you can put any of them back from ` +
+          `the Quarantine page.`,
+      )
+    ) {
+      return;
+    }
+    const btn = $("#btn-quarantine-all");
+    btn.disabled = true;
+    await quarantinePaths(mal.map((f) => f.path));
+    btn.disabled = false;
   });
 
   $("#toggle-network").addEventListener("change", async (e) => {

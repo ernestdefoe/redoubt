@@ -46,6 +46,11 @@ pub struct Entry {
     /// Set once restored, so the log keeps the history.
     #[serde(default)]
     pub restored: bool,
+    /// Set once destroyed. The manifest line stays as a record of what was
+    /// held and what became of it, but the file itself is gone and there is
+    /// nothing left to restore.
+    #[serde(default)]
+    pub purged: bool,
 }
 
 impl Entry {
@@ -56,6 +61,18 @@ impl Entry {
             .map(|d| d.name.as_str())
             .unwrap_or("unknown")
     }
+}
+
+/// A short, stable tag for an original path.
+///
+/// Only needs to separate two different paths quarantined in the same second
+/// with the same contents; it is not a security boundary, so a cheap
+/// non-cryptographic hash is the right tool.
+fn path_tag(path: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    path.to_string_lossy().to_lowercase().hash(&mut h);
+    format!("{:08x}", h.finish() as u32)
 }
 
 /// Obfuscate in place. XOR is its own inverse, so this both stores and
@@ -121,20 +138,37 @@ impl Quarantine {
         let size = data.len() as u64;
         let key = key_for(verdict.identity.sha256.as_deref(), size);
 
+        // The id has to be unique per *file*, not per content. Malware
+        // routinely drops identical copies of itself in several places, and an
+        // id of time-plus-content gave every one of them the same name: the
+        // second quarantine overwrote the first's payload, and the first file
+        // had already been deleted from disk. Copies vanished irrecoverably.
+        //
+        // The original path goes into the id as well, which distinguishes them
+        // for the same reason it distinguishes the files.
         let id = format!(
-            "{now:010}-{}",
+            "{now:010}-{}-{}",
             verdict
                 .identity
                 .sha256
                 .as_deref()
                 .map(|h| &h[..16.min(h.len())])
-                .unwrap_or("nohash")
+                .unwrap_or("nohash"),
+            path_tag(path)
         );
 
         scramble(&mut data, key);
 
         // Payload first, fully durable, before anything claims it exists.
         let payload = self.payload_dir().join(&id);
+        // Belt and braces. If a payload with this name somehow already exists,
+        // something else is held under it and must not be destroyed to make
+        // room - the caller gets an error and still has their file.
+        if payload.exists() {
+            anyhow::bail!(
+                "a quarantined file is already stored as {id}; refusing to overwrite it"
+            );
+        }
         {
             let mut f = std::fs::File::create(&payload)
                 .with_context(|| format!("creating {}", payload.display()))?;
@@ -151,6 +185,7 @@ impl Quarantine {
             detections: verdict.detections.clone(),
             key,
             restored: false,
+            purged: false,
         };
 
         self.append(&entry)?;
@@ -202,7 +237,14 @@ impl Quarantine {
 
     /// Entries still held (not restored).
     pub fn held(&self) -> Vec<Entry> {
-        self.entries().into_iter().filter(|e| !e.restored).collect()
+        // Restored and purged entries both stay in the manifest as history,
+        // and neither is still held. Filtering only on `restored` left
+        // destroyed files listed for ever, offering a Restore button with
+        // nothing behind it.
+        self.entries()
+            .into_iter()
+            .filter(|e| !e.restored && !e.purged)
+            .collect()
     }
 
     /// Put a quarantined file back where it came from.
@@ -250,11 +292,22 @@ impl Quarantine {
     /// worth more than the disk space, and losing it makes an FP impossible to
     /// diagnose after the fact.
     pub fn purge(&self, id: &str) -> Result<()> {
+        let mut entry = self
+            .entries()
+            .into_iter()
+            .find(|e| e.id == id)
+            .with_context(|| format!("nothing quarantined with id {id}"))?;
+
         let payload = self.payload_dir().join(id);
         if payload.exists() {
             std::fs::remove_file(&payload)
                 .with_context(|| format!("deleting {}", payload.display()))?;
         }
+
+        // Record it before returning, or the entry stays in `held` and offers
+        // a restore that can no longer work.
+        entry.purged = true;
+        self.append(&entry)?;
         Ok(())
     }
 
@@ -290,6 +343,76 @@ mod tests {
         ));
         v.recompute_severity();
         v
+    }
+
+    #[test]
+    fn identical_copies_in_the_same_second_do_not_overwrite_each_other() {
+        // Malware routinely drops identical copies of itself in several
+        // places. An id built only from time and content gave every copy the
+        // same name: the second quarantine overwrote the first's payload, and
+        // the first file was already gone from disk. Both were unrecoverable.
+        let dir = temp("dupes");
+        let payload = b"the very same malicious bytes";
+
+        let a = dir.join("invoice.exe");
+        let b = dir.join("update.exe");
+        std::fs::write(&a, payload).unwrap();
+        std::fs::write(&b, payload).unwrap();
+
+        let q = Quarantine::new(dir.join("q"));
+        let now = 1_700_000_000;
+        let ea = q.take(&a, &malicious_verdict(&a, payload), now).unwrap();
+        let eb = q.take(&b, &malicious_verdict(&b, payload), now).unwrap();
+
+        assert_ne!(ea.id, eb.id, "same second, same bytes, different files");
+        assert_eq!(q.held().len(), 2, "both must still be held");
+
+        // And both must come back to their own paths, intact.
+        q.restore(&ea.id).unwrap();
+        q.restore(&eb.id).unwrap();
+        assert_eq!(std::fs::read(&a).unwrap(), payload);
+        assert_eq!(std::fs::read(&b).unwrap(), payload);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_purged_entry_stops_being_held() {
+        // The bug this guards: purge deleted the payload and left the manifest
+        // line alone, so a permanently deleted file stayed in the quarantine
+        // list for ever - with a Restore button behind which there was nothing
+        // left to restore.
+        let dir = temp("purge-held");
+        let victim = dir.join("bad.exe");
+        std::fs::write(&victim, b"malicious payload bytes").unwrap();
+
+        let q = Quarantine::new(dir.join("q"));
+        let entry = q
+            .take(&victim, &malicious_verdict(&victim, b"malicious payload bytes"), 1_700_000_000)
+            .unwrap();
+        assert_eq!(q.held().len(), 1);
+
+        q.purge(&entry.id).unwrap();
+
+        assert!(q.held().is_empty(), "a destroyed file is not held");
+        assert!(
+            q.entries().iter().any(|e| e.id == entry.id && e.purged),
+            "but the manifest keeps it, so the history says what became of it"
+        );
+        assert!(
+            q.restore(&entry.id).is_err(),
+            "and restoring it must fail rather than half-succeed"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn purging_something_that_was_never_held_is_refused() {
+        let dir = temp("purge-unknown");
+        let q = Quarantine::new(dir.join("q"));
+        assert!(q.purge("not-a-real-id").is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

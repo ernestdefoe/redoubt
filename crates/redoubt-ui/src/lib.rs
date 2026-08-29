@@ -726,6 +726,93 @@ fn handle(app: &Arc<App>, request: &mut tiny_http::Request) -> tiny_http::Respon
             }
         }
 
+        // Quarantine files the person has chosen, by path.
+        //
+        // Every path is **re-scanned here** rather than trusted. The list the
+        // page is working from may be minutes old: the file may have changed,
+        // or been replaced by something innocent, and the page could in
+        // principle ask for anything at all. Nothing is moved unless this
+        // process looks at the file, right now, and still calls it malicious.
+        (Method::Post, "/api/quarantine/take") => {
+            let body = read_body(request);
+            let paths: Vec<String> = body
+                .get("paths")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            if paths.is_empty() {
+                return json_response(json!({ "error": "no paths given" }), 400);
+            }
+
+            let Some(protection) = app.protection() else {
+                return json_response(json!({ "error": "quarantine unavailable" }), 409);
+            };
+            let Some(engine) = app.engine() else {
+                return json_response(json!({ "error": "no signature index loaded" }), 409);
+            };
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            let mut session = engine.session();
+            let mut taken = Vec::new();
+            let mut refused = Vec::new();
+
+            for path in &paths {
+                let p = PathBuf::from(path);
+                if !p.is_file() {
+                    refused.push(json!({ "path": path, "why": "the file is no longer there" }));
+                    continue;
+                }
+                let verdict = match session.scan_path(&p) {
+                    redoubt_core::scanner::ScanOutcome::Scanned(v) => v,
+                    redoubt_core::scanner::ScanOutcome::Skipped(why) => {
+                        refused.push(json!({
+                            "path": path,
+                            "why": format!("skipped on re-scan: {why}"),
+                        }));
+                        continue;
+                    }
+                };
+                // `take` refuses anything not actionable, but saying why here
+                // gives a person something to act on instead of a bare no.
+                if !verdict.severity.is_actionable() {
+                    refused.push(json!({
+                        "path": path,
+                        "why": format!(
+                            "re-scanned just now and it is {}, not malicious",
+                            verdict.severity.as_str()
+                        ),
+                    }));
+                    continue;
+                }
+                match protection.quarantine().take(&p, &verdict, now) {
+                    Ok(entry) => taken.push(json!({ "path": path, "id": entry.id })),
+                    Err(e) => refused.push(json!({ "path": path, "why": format!("{e:#}") })),
+                }
+            }
+
+            json_response(json!({ "taken": taken, "refused": refused }), 200)
+        }
+
+        // Destroy a quarantined file for good. There is no undo, which is why
+        // it is a separate route from restore rather than a flag on it.
+        (Method::Post, "/api/quarantine/delete") => {
+            let body = read_body(request);
+            let Some(id) = body.get("id").and_then(|v| v.as_str()) else {
+                return json_response(json!({ "error": "no id given" }), 400);
+            };
+            match app.protection() {
+                Some(p) => match p.quarantine().purge(id) {
+                    Ok(()) => json_response(json!({ "deleted": id }), 200),
+                    Err(e) => json_response(json!({ "error": format!("{e:#}") }), 400),
+                },
+                None => json_response(json!({ "error": "quarantine unavailable" }), 409),
+            }
+        }
+
         (Method::Post, "/api/scan") => {
             let body = read_body(request);
             let Some(path) = body.get("path").and_then(|p| p.as_str()) else {

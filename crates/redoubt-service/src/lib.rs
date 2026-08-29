@@ -752,6 +752,32 @@ mod tests {
         PIPE.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Whether the scan pipe is free for a test to use.
+    ///
+    /// Redoubt being installed and running is a perfectly ordinary state for a
+    /// contributor's machine, and the pipe name is fixed by design, so the
+    /// installed service answers these tests instead of the fixture. Failing
+    /// would paint the suite red for a reason unrelated to anybody's change -
+    /// so they skip, loudly, because a test that quietly does nothing is worse
+    /// than one that fails.
+    fn pipe_is_free() -> bool {
+        if std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(ipc::PIPE_NAME)
+            .is_err()
+        {
+            return true;
+        }
+        eprintln!(
+            "
+  SKIPPED: {} is already answering. Stop the Redoubt service              or interface and run again to exercise it.
+",
+            ipc::PIPE_NAME
+        );
+        false
+    }
+
     /// Connect to the scan pipe, waiting for the accept loop to come up.
     fn connect_to_pipe() -> std::fs::File {
         for _ in 0..100 {
@@ -1066,6 +1092,10 @@ mod tests {
 
     #[test]
     fn the_scan_channel_answers_over_a_real_pipe() {
+        if !pipe_is_free() {
+            return;
+        }
+
         // The AMSI provider is a separate DLL in a foreign process, so the
         // only meaningful test of this path is an actual pipe round-trip.
         use std::io::{Read, Write};
@@ -1093,6 +1123,10 @@ mod tests {
 
     #[test]
     fn the_scan_channel_reports_clean_content_as_clean() {
+        if !pipe_is_free() {
+            return;
+        }
+
         use std::io::{Read, Write};
 
         let f = fixture("ipc-clean", Mode::Observe);
