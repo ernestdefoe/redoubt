@@ -28,9 +28,11 @@ anything until you explicitly turn enforcement on.
 | Quarantine + restore | **Working** |
 | Desktop interface | **Working** |
 | Disk cleanup + startup manager | **Working** |
-| Windows service registration | **Working** — `redoubtd install` |
+| Windows service registration | **Working** — installer, or `redoubtd install` |
 | Named-pipe scan channel | **Working** — one engine, many hosts |
-| AMSI provider (script blocking) | **Working** — `redoubtd amsi-install` |
+| AMSI provider (script blocking) | **Working** — verified end to end on a real machine |
+| UTF-16 script content | **Working** — PowerShell's own encoding |
+| Windows installer (MSI) | **Working** — `installer/build.ps1` |
 | Filesystem minifilter (pre-execution blocking) | Not built |
 | Network C2 blocking | Not built |
 
@@ -274,6 +276,53 @@ worse than one that admits what it misses.
 `redoubt db update` prints a per-format breakdown of everything it could not
 index, with an explanation of each. The interface shows the same thing under
 Signatures → Not indexed.
+
+---
+
+## Installing
+
+`installer/out/Redoubt-<version>-x64.msi` is a normal Windows installer:
+double-click it, or `msiexec /i Redoubt-0.1.0-x64.msi`. It needs
+administrator rights, which Windows asks for itself.
+
+It installs three binaries into `C:\Program Files\Redoubt`, registers the
+background service, registers the AMSI script provider, and puts Redoubt in
+the Start menu. Nothing else on the machine is touched.
+
+Two things it deliberately does **not** do:
+
+- **It does not turn on enforcement.** Redoubt installs in observe mode and
+  reports what it finds. Quarantine stays off until you turn it on, because
+  installing a security product should not silently start deleting files.
+- **It does not remove your data when uninstalled.** The signature database,
+  the logs and - above all - anything in quarantine stay under
+  `%ProgramData%\Redoubt`. Deleting somebody's quarantined files on the way
+  out is unforgivable.
+
+Building the installer needs [WiX](https://wixtoolset.org) v5 and Python:
+
+```
+dotnet tool install --global wix --version 5.0.2
+wix extension add -g WixToolset.UI.wixext/5.0.2
+wix extension add -g WixToolset.Util.wixext/5.0.2
+pwsh installer/build.ps1
+```
+
+`installer/inspect.ps1 <msi>` prints what a package will actually do -
+files, service, registry, shortcuts - read from the package's own tables
+rather than from the source that produced it. A registry key that quietly
+failed to make it into the build looks, from the `.wxs`, exactly like one
+that did.
+
+The mark is generated, not drawn by hand: `python tools/brand.py` produces
+the icon at every size Windows asks for, plus the installer artwork, from
+the same colours the interface uses. The three binaries carry it along with
+their version and publisher, because an unsigned tool with a blank icon and
+no publisher in its properties is one nobody should grant administrator
+rights to.
+
+**The installer is not code-signed.** SmartScreen will warn about it until
+it is signed with a certificate.
 
 ---
 

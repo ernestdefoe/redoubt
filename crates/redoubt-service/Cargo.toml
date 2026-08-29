@@ -29,3 +29,9 @@ crossbeam-channel = "0.5"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_ProcessStatus", "Win32_Security", "Win32_System_SystemInformation", "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Com"] }
 windows-service = "0.8.1"
 winreg = "0.56.0"
+
+[build-dependencies]
+# Stamps the icon and version metadata onto the binary. A security tool with a
+# blank icon and no publisher in its properties is one nobody should trust with
+# administrator rights.
+winresource = "0.1"

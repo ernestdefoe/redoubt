@@ -8,3 +8,6 @@ dist/
 /shots-rt/
 /shots-opt/
 /shots-ransom/
+installer/stage/
+installer/out/
+brand/_*-preview.png

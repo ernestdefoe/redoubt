@@ -1,0 +1,179 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The Redoubt installer.
+
+  An MSI rather than a self-extracting .exe, because Windows already knows how
+  to install, repair, upgrade and cleanly remove one. A security product that
+  cannot be removed properly is a security problem of its own.
+
+  Three things here are deliberate and worth stating:
+
+  * The AMSI provider's registry keys are declared as components rather than
+    written by a custom action. The installer is already elevated, so there is
+    nothing to gain from shelling out - and declaring them means Windows
+    removes them on uninstall, guaranteed, instead of relying on our code
+    running successfully at the worst possible moment.
+  * The service is installed but left in observe mode, which is Redoubt's
+    default. Installing a security product should not silently start deleting
+    a person's files.
+  * Nothing under %ProgramData%\Redoubt is removed on uninstall. That holds
+    the signature database, the logs and - critically - quarantined files.
+    Deleting somebody's quarantine as a parting gesture is unforgivable.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+  <Package
+      Name="Redoubt"
+      Manufacturer="Ernest Defoe"
+      Version="$(var.Version)"
+      UpgradeCode="4C7F2A61-9B3D-4E58-A0D2-6F1E8C57B394"
+      Scope="perMachine"
+      Compressed="yes"
+      InstallerVersion="500">
+
+    <!-- Upgrades replace in place rather than stacking up in Add/Remove. -->
+    <MajorUpgrade
+        AllowSameVersionUpgrades="yes"
+        DowngradeErrorMessage="A newer version of Redoubt is already installed. Remove it first if you really mean to go back." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Add/Remove Programs. A blank entry here is what people look at when
+         deciding whether something on their machine is legitimate. -->
+    <Icon Id="RedoubtIcon" SourceFile="$(var.BrandDir)\redoubt.ico" />
+    <Property Id="ARPPRODUCTICON" Value="RedoubtIcon" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/ernestdefoe/redoubt" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/ernestdefoe/redoubt" />
+    <Property Id="ARPNOREPAIR" Value="0" />
+
+    <!-- Offer to open the interface when it is done. Unchecking it is fine;
+         the service is already running either way. -->
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Open Redoubt now" />
+    <Property Id="WixShellExecTarget" Value="[#RedoubtExe]" />
+    <CustomAction Id="LaunchRedoubt" BinaryRef="Wix4UtilCA_X64" DllEntry="WixShellExec" Impersonate="yes" />
+
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.InstallerDir)\License.rtf" />
+    <WixVariable Id="WixUIBannerBmp" Value="$(var.BrandDir)\wizard-banner.bmp" />
+    <WixVariable Id="WixUIDialogBmp" Value="$(var.BrandDir)\wizard-dialog.bmp" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Redoubt" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <Feature Id="Main" Title="Redoubt" Level="1" AllowAbsent="no">
+      <ComponentGroupRef Id="Binaries" />
+      <ComponentGroupRef Id="Integration" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+
+    <!-- ─────────────────────────────  files  ───────────────────────────── -->
+
+    <ComponentGroup Id="Binaries" Directory="INSTALLFOLDER">
+      <Component Id="RedoubtExeComponent">
+        <File Id="RedoubtExe" Source="$(var.StageDir)\redoubt.exe" KeyPath="yes" />
+      </Component>
+
+      <Component Id="RedoubtdExeComponent">
+        <File Id="RedoubtdExe" Source="$(var.StageDir)\redoubtd.exe" KeyPath="yes" />
+
+        <!-- The resident protection service.
+             Started, but in observe mode: it reports and never quarantines
+             until that is turned on deliberately. -->
+        <ServiceInstall
+            Id="RedoubtService"
+            Name="Redoubt"
+            DisplayName="Redoubt Protection"
+            Description="Real-time file scanning, ransomware detection and the script-scanning channel."
+            Type="ownProcess"
+            Start="auto"
+            ErrorControl="normal"
+            Account="LocalSystem"
+            Arguments="--service"
+            Vital="yes">
+          <!-- Restart on failure rather than quietly staying down: an
+               antivirus that is not running looks exactly like one that is,
+               and ransomware that kills the service should gain a minute, not
+               the machine.
+
+               util:ServiceConfig, not the MSI ServiceConfig element - the
+               latter cannot express failure actions at all, which would have
+               left this comment describing something that does not happen. -->
+          <util:ServiceConfig
+              FirstFailureActionType="restart"
+              SecondFailureActionType="restart"
+              ThirdFailureActionType="restart"
+              RestartServiceDelayInSeconds="60"
+              ResetPeriodInDays="1" />
+        </ServiceInstall>
+
+        <ServiceControl
+            Id="RedoubtServiceControl"
+            Name="Redoubt"
+            Start="install"
+            Stop="both"
+            Remove="uninstall"
+            Wait="yes" />
+      </Component>
+
+      <Component Id="RedoubtAmsiComponent">
+        <File Id="RedoubtAmsiDll" Source="$(var.StageDir)\redoubt_amsi.dll" KeyPath="yes" />
+      </Component>
+
+      <Component Id="ReadmeComponent">
+        <File Id="ReadmeFile" Source="$(var.RootDir)\README.md" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- ──────────────────────  Windows integration  ────────────────────── -->
+
+    <ComponentGroup Id="Integration" Directory="INSTALLFOLDER">
+      <!--
+        The AMSI provider, in the two places Windows looks.
+
+        Writing only the COM class produces a provider that exists and is
+        never called - indistinguishable from one that does not work. Both
+        keys or neither.
+      -->
+      <Component Id="AmsiClassRegistration" Guid="A1F4D30E-7C62-4B18-9E55-2D8A6F0B4C71">
+        <RegistryKey Root="HKLM" Key="SOFTWARE\Classes\CLSID\{7B8E4C21-3D5A-4F19-9E6B-2C1D8A0F5E33}">
+          <RegistryValue Type="string" Value="Redoubt AMSI Provider" KeyPath="yes" />
+        </RegistryKey>
+        <RegistryKey Root="HKLM" Key="SOFTWARE\Classes\CLSID\{7B8E4C21-3D5A-4F19-9E6B-2C1D8A0F5E33}\InprocServer32">
+          <RegistryValue Type="string" Value="[INSTALLFOLDER]redoubt_amsi.dll" />
+          <!-- "Both" lets COM call the provider on whatever thread the host is
+               already on, with no marshalling in the way. -->
+          <RegistryValue Type="string" Name="ThreadingModel" Value="Both" />
+        </RegistryKey>
+      </Component>
+
+      <Component Id="AmsiProviderRegistration" Guid="B2E5C41F-8D73-4A29-8F66-3E9B7A1C5D82">
+        <RegistryKey Root="HKLM" Key="SOFTWARE\Microsoft\AMSI\Providers\{7B8E4C21-3D5A-4F19-9E6B-2C1D8A0F5E33}">
+          <RegistryValue Type="string" Value="Redoubt AMSI Provider" KeyPath="yes" />
+        </RegistryKey>
+      </Component>
+    </ComponentGroup>
+
+    <Component Id="StartMenuShortcut" Directory="ProgramMenuFolder" Guid="C3D6B52A-9E84-4F3A-B077-4F0C8B2D6E93">
+      <Shortcut
+          Id="RedoubtShortcut"
+          Name="Redoubt"
+          Description="Open the Redoubt interface"
+          Target="[#RedoubtExe]"
+          Arguments="ui"
+          Icon="RedoubtIcon"
+          WorkingDirectory="INSTALLFOLDER" />
+      <!-- A perMachine shortcut still needs a per-user key path, or repair
+           has nothing to check it against. -->
+      <RegistryValue Root="HKMU" Key="Software\Ernest Defoe\Redoubt" Name="Installed" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <InstallExecuteSequence>
+      <Custom Action="LaunchRedoubt" After="InstallFinalize" Condition="NOT Installed AND WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1" />
+    </InstallExecuteSequence>
+
+  </Package>
+</Wix>

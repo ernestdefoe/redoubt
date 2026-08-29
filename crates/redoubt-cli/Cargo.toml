@@ -22,3 +22,9 @@ rayon.workspace = true
 walkdir.workspace = true
 redoubt-ui = { version = "0.1.0", path = "../redoubt-ui" }
 redoubt-optimize = { version = "0.1.0", path = "../redoubt-optimize" }
+
+[build-dependencies]
+# Stamps the icon and version metadata onto the binary. A security tool with a
+# blank icon and no publisher in its properties is one nobody should trust with
+# administrator rights.
+winresource = "0.1"
