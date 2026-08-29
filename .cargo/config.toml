@@ -1,0 +1,4 @@
+# Keep the build directory OUT of OneDrive. A Rust target/ dir is tens of
+# thousands of small files; letting OneDrive sync it will melt the machine.
+[build]
+target-dir = "C:/Users/ernes/.cargo-target/redoubt"

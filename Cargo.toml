@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/redoubt-core",
+    "crates/redoubt-cli",
+    "crates/redoubt-service",
+]
+
+[workspace.package]
+version    = "0.1.0"
+edition    = "2021"
+license    = "MIT"
+authors    = ["Ernest Defoe <ernestdefoe@gmail.com>"]
+repository = "https://github.com/ernestdefoe/redoubt"
+
+[workspace.dependencies]
+anyhow      = "1"
+thiserror   = "2"
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+toml        = "0.8"
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+parking_lot = "0.12"
+dashmap     = "6"
+rayon       = "1"
+walkdir     = "2"
+sha2        = "0.10"
+sha1        = "0.10"
+md-5        = "0.10"
+hex         = "0.4"
+flate2      = "1"
+tar         = "0.4"
+memmap2     = "0.9"
+time        = { version = "0.3", features = ["formatting", "parsing", "serde", "macros", "local-offset"] }
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+panic         = "abort"
+strip         = true

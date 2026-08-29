@@ -1,0 +1,22 @@
+[package]
+name = "redoubt-service"
+description = "Redoubt Windows service: real-time event sources, scan workers, IPC."
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+
+[[bin]]
+name = "redoubtd"
+path = "src/main.rs"
+
+[dependencies]
+redoubt-core = { path = "../redoubt-core" }
+anyhow.workspace      = true
+serde.workspace       = true
+serde_json.workspace  = true
+tracing.workspace     = true
+tracing-subscriber.workspace = true
+parking_lot.workspace = true
+time.workspace        = true

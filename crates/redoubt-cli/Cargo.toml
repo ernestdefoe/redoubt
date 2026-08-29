@@ -1,0 +1,22 @@
+[package]
+name = "redoubt-cli"
+description = "Redoubt command line: database updates, on-demand scanning, diagnostics."
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+
+[[bin]]
+name = "redoubt"
+path = "src/main.rs"
+
+[dependencies]
+redoubt-core = { path = "../redoubt-core" }
+anyhow.workspace     = true
+serde_json.workspace = true
+time.workspace       = true
+clap = { version = "4", features = ["derive"] }
+toml.workspace = true
+rayon.workspace = true
+walkdir.workspace = true
