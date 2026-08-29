@@ -25,6 +25,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use jobs::{JobKind, JobState, Jobs};
+use redoubt_service::Protection;
 
 // UI assets are compiled in, so the binary is self-contained and cannot be
 // served a tampered page from a writable directory next to it.
@@ -39,18 +40,31 @@ pub struct App {
     /// `None` until an index exists. The UI stays usable without one so the
     /// user can press "Update signatures" rather than meeting a dead page.
     engine: RwLock<Option<Arc<ScanEngine>>>,
+    /// Resident protection runs in this process, so the toggle in the page
+    /// actually starts and stops it rather than reporting on something it
+    /// cannot reach.
+    protection: RwLock<Option<Protection>>,
     jobs: Jobs,
 }
 
 impl App {
     pub fn new(cfg: Config, config_path: PathBuf) -> Self {
         let engine = ScanEngine::load(cfg.clone()).ok().map(Arc::new);
+        let protection = engine
+            .clone()
+            .map(|e| Protection::new(cfg.clone(), e));
         Self {
             cfg: RwLock::new(cfg),
             config_path,
             engine: RwLock::new(engine),
+            protection: RwLock::new(protection),
             jobs: Jobs::new(),
         }
+    }
+
+    /// Resident protection, if an engine is loaded.
+    fn protection(&self) -> Option<Protection> {
+        self.protection.read().clone()
     }
 
     fn config(&self) -> Config {
@@ -58,9 +72,27 @@ impl App {
     }
 
     /// Rebuild the engine from the current config and signature files.
+    ///
+    /// Protection is rebuilt around the new engine and restarted if it was
+    /// running - otherwise a signature update would silently leave the machine
+    /// protected by the old index, or not protected at all.
     fn reload_engine(&self) -> Result<()> {
-        let engine = ScanEngine::load(self.config())?;
-        *self.engine.write() = Some(Arc::new(engine));
+        let was_running = self.protection().map(|p| p.is_running()).unwrap_or(false);
+        if let Some(p) = self.protection() {
+            p.stop();
+        }
+
+        let cfg = self.config();
+        let engine = Arc::new(ScanEngine::load(cfg.clone())?);
+        *self.engine.write() = Some(engine.clone());
+
+        let fresh = Protection::new(cfg, engine);
+        if was_running {
+            if let Err(e) = fresh.start() {
+                tracing::error!(error = %e, "could not restart protection after reload");
+            }
+        }
+        *self.protection.write() = Some(fresh);
         Ok(())
     }
 
@@ -212,11 +244,13 @@ fn status_json(app: &App) -> serde_json::Value {
         "version": redoubt_core::VERSION,
         "mode": cfg.mode.as_str(),
         "engine": engine,
-        // Stated plainly rather than showing a green light for something that
-        // is not running.
-        "realtime": {
-            "running": false,
-            "note": "On-demand scanning only. The resident service is not installed yet.",
+        "realtime": match app.protection() {
+            Some(p) => serde_json::to_value(p.status()).unwrap_or(json!({ "running": false })),
+            None => json!({
+                "running": false,
+                "note": "No signature index loaded, so protection cannot start.",
+                "watching": [], "counters": {}, "queue_depth": 0,
+            }),
         },
         "gaps": gaps_for(&index_path),
         "sources": sources_for(&cfg),
@@ -432,6 +466,61 @@ fn handle(app: &Arc<App>, request: &mut tiny_http::Request) -> tiny_http::Respon
                     json_response(serde_json::to_value(cfg).unwrap_or(json!({})), 200)
                 }
                 Err(e) => json_response(json!({ "error": format!("{e:#}") }), 500),
+            }
+        }
+
+        (Method::Post, "/api/realtime/start") => match app.protection() {
+            Some(p) => match p.start() {
+                Ok(()) => json_response(
+                    serde_json::to_value(p.status()).unwrap_or(json!({})),
+                    200,
+                ),
+                Err(e) => json_response(json!({ "error": format!("{e:#}") }), 500),
+            },
+            None => json_response(
+                json!({ "error": "no signature index loaded - update signatures first" }),
+                409,
+            ),
+        },
+
+        (Method::Post, "/api/realtime/stop") => match app.protection() {
+            Some(p) => {
+                p.stop();
+                json_response(serde_json::to_value(p.status()).unwrap_or(json!({})), 200)
+            }
+            None => json_response(json!({ "error": "protection is not available" }), 409),
+        },
+
+        (Method::Get, "/api/realtime/findings") => match app.protection() {
+            Some(p) => json_response(
+                serde_json::to_value(p.recent()).unwrap_or(json!([])),
+                200,
+            ),
+            None => json_response(json!([]), 200),
+        },
+
+        (Method::Get, "/api/quarantine") => match app.protection() {
+            Some(p) => json_response(
+                serde_json::to_value(p.quarantine().held()).unwrap_or(json!([])),
+                200,
+            ),
+            None => json_response(json!([]), 200),
+        },
+
+        (Method::Post, "/api/quarantine/restore") => {
+            let body = read_body(request);
+            let Some(id) = body.get("id").and_then(|v| v.as_str()) else {
+                return json_response(json!({ "error": "no id given" }), 400);
+            };
+            match app.protection() {
+                Some(p) => match p.quarantine().restore(id) {
+                    Ok(path) => json_response(
+                        json!({ "restored": path.to_string_lossy() }),
+                        200,
+                    ),
+                    Err(e) => json_response(json!({ "error": format!("{e:#}") }), 400),
+                },
+                None => json_response(json!({ "error": "quarantine unavailable" }), 409),
             }
         }
 

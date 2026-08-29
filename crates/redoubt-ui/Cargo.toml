@@ -18,3 +18,4 @@ rayon.workspace       = true
 walkdir.workspace     = true
 time.workspace        = true
 tiny_http = "0.12"
+redoubt-service = { version = "0.1.0", path = "../redoubt-service" }

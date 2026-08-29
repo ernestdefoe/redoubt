@@ -1,11 +1,15 @@
 [package]
 name = "redoubt-service"
-description = "Redoubt Windows service: real-time event sources, scan workers, IPC."
+description = "Redoubt resident protection: file event sources, scan workers, enforcement."
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true
 authors.workspace    = true
 repository.workspace = true
+
+[lib]
+name = "redoubt_service"
+path = "src/lib.rs"
 
 [[bin]]
 name = "redoubtd"
@@ -20,3 +24,5 @@ tracing.workspace     = true
 tracing-subscriber.workspace = true
 parking_lot.workspace = true
 time.workspace        = true
+notify = "8"
+crossbeam-channel = "0.5"

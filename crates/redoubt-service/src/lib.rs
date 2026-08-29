@@ -1,0 +1,583 @@
+//! Resident protection.
+//!
+//! Watches the places files actually arrive, scans what changes, and - only in
+//! enforce mode, and only for genuinely malicious verdicts - quarantines.
+//!
+//! # What this covers, and what it does not
+//!
+//! This is **detect-and-react**, not pre-execution blocking: a file is scanned
+//! shortly after it lands, not before it can be opened. That is an honest and
+//! useful level of protection for the way malware usually arrives on a desktop
+//! (a download, an archive extraction, a dropper writing to `%TEMP%`), and it
+//! needs no driver and no elevation.
+//!
+//! True pre-execution blocking needs a filesystem minifilter, and script
+//! blocking needs an AMSI provider. Neither is built yet, and [`Status::note`]
+//! says so rather than letting the UI imply otherwise.
+//!
+//! # Why a debounce
+//!
+//! A single file copy produces a burst of change notifications. Scanning on
+//! each one would rescan a partially written file repeatedly and report
+//! nonsense. Paths are therefore held for a short settle period and coalesced,
+//! so one copy costs one scan.
+
+pub mod watcher;
+
+use anyhow::{Context, Result};
+use crossbeam_channel::{bounded, Receiver, Sender};
+use parking_lot::Mutex;
+use redoubt_core::cache::{CacheKey, CachedVerdict, VerdictCache};
+use redoubt_core::config::{Config, Mode};
+use redoubt_core::quarantine::Quarantine;
+use redoubt_core::scanner::{ScanEngine, ScanOutcome};
+use redoubt_core::verdict::{Severity, Verdict};
+use serde::Serialize;
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// How many recent verdicts to keep for the UI.
+const RECENT_CAPACITY: usize = 200;
+
+/// Live counters.
+#[derive(Debug, Default, Serialize)]
+pub struct Counters {
+    /// Change notifications received from the OS.
+    pub events: AtomicU64,
+    /// Paths that reached a scan worker.
+    pub scanned: AtomicU64,
+    /// Answered from the verdict cache without touching the file.
+    pub cache_hits: AtomicU64,
+    /// Dropped because the queue was full.
+    pub dropped: AtomicU64,
+    pub malicious: AtomicU64,
+    pub suspicious: AtomicU64,
+    pub quarantined: AtomicU64,
+    /// Enforcement was wanted but failed.
+    pub quarantine_failures: AtomicU64,
+}
+
+impl Counters {
+    fn snapshot(&self) -> CounterSnapshot {
+        let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        CounterSnapshot {
+            events: g(&self.events),
+            scanned: g(&self.scanned),
+            cache_hits: g(&self.cache_hits),
+            dropped: g(&self.dropped),
+            malicious: g(&self.malicious),
+            suspicious: g(&self.suspicious),
+            quarantined: g(&self.quarantined),
+            quarantine_failures: g(&self.quarantine_failures),
+        }
+    }
+}
+
+/// A plain copy of the counters, for serialising.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct CounterSnapshot {
+    pub events: u64,
+    pub scanned: u64,
+    pub cache_hits: u64,
+    pub dropped: u64,
+    pub malicious: u64,
+    pub suspicious: u64,
+    pub quarantined: u64,
+    pub quarantine_failures: u64,
+}
+
+/// What the UI shows about resident protection.
+#[derive(Debug, Clone, Serialize)]
+pub struct Status {
+    pub running: bool,
+    pub mode: String,
+    /// Directories being watched.
+    pub watching: Vec<PathBuf>,
+    pub workers: usize,
+    pub queue_depth: usize,
+    pub counters: CounterSnapshot,
+    pub cache_entries: usize,
+    pub cache_hit_rate: f64,
+    /// Plain statement of the protection level. Never dressed up.
+    pub note: String,
+}
+
+struct Inner {
+    cfg: Config,
+    engine: Arc<ScanEngine>,
+    cache: VerdictCache,
+    quarantine: Quarantine,
+    counters: Counters,
+    recent: Mutex<VecDeque<Verdict>>,
+    running: AtomicBool,
+    tx: Sender<PathBuf>,
+    rx: Receiver<PathBuf>,
+    generation: u32,
+}
+
+/// A running (or stopped) protection instance.
+#[derive(Clone)]
+pub struct Protection {
+    inner: Arc<Inner>,
+    watcher: Arc<Mutex<Option<watcher::Watcher>>>,
+    workers: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+}
+
+fn now_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+impl Protection {
+    /// Build a protection instance around an already-loaded engine.
+    pub fn new(cfg: Config, engine: Arc<ScanEngine>) -> Self {
+        let capacity = cfg.realtime.queue_capacity.max(64);
+        let (tx, rx) = bounded(capacity);
+        let generation = engine.stats().db_version;
+
+        Self {
+            inner: Arc::new(Inner {
+                cache: VerdictCache::new(capacity * 8),
+                quarantine: Quarantine::new(cfg.paths.quarantine.clone()),
+                counters: Counters::default(),
+                recent: Mutex::new(VecDeque::with_capacity(RECENT_CAPACITY)),
+                running: AtomicBool::new(false),
+                tx,
+                rx,
+                generation,
+                engine,
+                cfg,
+            }),
+            watcher: Arc::new(Mutex::new(None)),
+            workers: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.inner.running.load(Ordering::Relaxed)
+    }
+
+    /// Directories that will be watched.
+    pub fn watch_roots(&self) -> Vec<PathBuf> {
+        watcher::default_roots(&self.inner.cfg)
+    }
+
+    /// Start watching and scanning. Idempotent.
+    pub fn start(&self) -> Result<()> {
+        if self.is_running() {
+            return Ok(());
+        }
+        let roots = self.watch_roots();
+        if roots.is_empty() {
+            anyhow::bail!("no watchable directories are configured");
+        }
+
+        self.inner.running.store(true, Ordering::Relaxed);
+
+        // Workers first, so nothing is queued before anyone can drain it.
+        let worker_count = self.inner.cfg.worker_count();
+        let mut handles = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let inner = self.inner.clone();
+            handles.push(std::thread::spawn(move || worker_loop(inner)));
+        }
+        *self.workers.lock() = handles;
+
+        let inner = self.inner.clone();
+        let w = watcher::Watcher::start(&roots, move |path| {
+            inner.counters.events.fetch_add(1, Ordering::Relaxed);
+            // A full queue means the machine is producing files faster than we
+            // can scan them. Dropping is the right failure: blocking here would
+            // stall the watcher thread and lose events anyway, silently.
+            if inner.tx.try_send(path).is_err() {
+                inner.counters.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+        .context("starting the filesystem watcher")?;
+        *self.watcher.lock() = Some(w);
+
+        tracing::info!(roots = roots.len(), workers = worker_count, "resident protection started");
+        Ok(())
+    }
+
+    /// Stop watching and drain the workers.
+    pub fn stop(&self) {
+        if !self.is_running() {
+            return;
+        }
+        self.inner.running.store(false, Ordering::Relaxed);
+        // Dropping the watcher stops new events; workers then see the flag.
+        *self.watcher.lock() = None;
+
+        let handles = std::mem::take(&mut *self.workers.lock());
+        for h in handles {
+            let _ = h.join();
+        }
+        tracing::info!("resident protection stopped");
+    }
+
+    pub fn status(&self) -> Status {
+        let cache = self.inner.cache.stats();
+        let running = self.is_running();
+        Status {
+            running,
+            mode: self.inner.cfg.mode.as_str().to_string(),
+            watching: if running { self.watch_roots() } else { Vec::new() },
+            workers: self.inner.cfg.worker_count(),
+            queue_depth: self.inner.rx.len(),
+            counters: self.inner.counters.snapshot(),
+            cache_entries: cache.entries,
+            cache_hit_rate: cache.hit_rate(),
+            note: self.note(),
+        }
+    }
+
+    /// An honest description of the protection level.
+    fn note(&self) -> String {
+        if !self.is_running() {
+            return "On-demand scanning only. Resident protection is not running.".to_string();
+        }
+        let enforcing = self.inner.cfg.mode == Mode::Enforce;
+        format!(
+            "Watching {} location(s); files are scanned shortly after they change. \
+             {} Pre-execution blocking needs a filesystem minifilter, which is not built yet.",
+            self.watch_roots().len(),
+            if enforcing {
+                "Malicious files are quarantined."
+            } else {
+                "Detections are reported only - nothing is quarantined."
+            }
+        )
+    }
+
+    /// Recent non-clean verdicts, newest first.
+    pub fn recent(&self) -> Vec<Verdict> {
+        self.inner.recent.lock().iter().rev().cloned().collect()
+    }
+
+    pub fn quarantine(&self) -> &Quarantine {
+        &self.inner.quarantine
+    }
+
+    /// Queue a path explicitly. Used by tests and by anything that wants a
+    /// specific file looked at.
+    pub fn submit(&self, path: PathBuf) -> bool {
+        self.inner.counters.events.fetch_add(1, Ordering::Relaxed);
+        match self.inner.tx.try_send(path) {
+            Ok(()) => true,
+            Err(_) => {
+                self.inner.counters.dropped.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+    }
+
+    /// Drain the queue synchronously. Tests use this instead of sleeping.
+    pub fn drain_for_test(&self) {
+        while let Ok(path) = self.inner.rx.try_recv() {
+            handle_path(&self.inner, &path, &mut self.inner.engine.session());
+        }
+    }
+}
+
+fn worker_loop(inner: Arc<Inner>) {
+    let mut session = inner.engine.session();
+    while inner.running.load(Ordering::Relaxed) {
+        // A timeout rather than a blocking recv, so a stop is noticed promptly
+        // instead of waiting for the next file to change.
+        match inner.rx.recv_timeout(std::time::Duration::from_millis(250)) {
+            Ok(path) => handle_path(&inner, &path, &mut session),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+fn handle_path(
+    inner: &Arc<Inner>,
+    path: &std::path::Path,
+    session: &mut redoubt_core::scanner::ScanSession<'_>,
+) {
+    // Cache check before touching the file's contents.
+    let key = std::fs::metadata(path)
+        .ok()
+        .and_then(|m| CacheKey::from_metadata(&m, inner.generation));
+    if let Some(key) = key {
+        if let Some(hit) = inner.cache.get(path, &key) {
+            inner.counters.cache_hits.fetch_add(1, Ordering::Relaxed);
+            let _ = hit;
+            return;
+        }
+    }
+
+    let ScanOutcome::Scanned(verdict) = session.scan_path(path) else {
+        return;
+    };
+    inner.counters.scanned.fetch_add(1, Ordering::Relaxed);
+
+    if let Some(key) = key {
+        inner.cache.insert(
+            path,
+            CachedVerdict {
+                key,
+                severity: verdict.severity,
+                name: verdict.primary_name().map(str::to_string),
+            },
+        );
+    }
+
+    if verdict.is_clean() {
+        return;
+    }
+
+    match verdict.severity {
+        Severity::Malicious => {
+            inner.counters.malicious.fetch_add(1, Ordering::Relaxed);
+        }
+        Severity::Suspicious => {
+            inner.counters.suspicious.fetch_add(1, Ordering::Relaxed);
+        }
+        Severity::Clean => {}
+    }
+
+    tracing::warn!(
+        path = %path.display(),
+        severity = %verdict.severity,
+        detection = verdict.primary_name().unwrap_or("-"),
+        "detection"
+    );
+
+    {
+        let mut recent = inner.recent.lock();
+        if recent.len() == RECENT_CAPACITY {
+            recent.pop_front();
+        }
+        recent.push_back((*verdict).clone());
+    }
+
+    // Enforcement. Both conditions are required, and `is_actionable` is the
+    // structural guarantee that a heuristic or PUA finding can never get here.
+    if inner.cfg.mode == Mode::Enforce && verdict.severity.is_actionable() {
+        match inner.quarantine.take(path, &verdict, now_epoch()) {
+            Ok(entry) => {
+                inner.counters.quarantined.fetch_add(1, Ordering::Relaxed);
+                inner.cache.invalidate(path);
+                tracing::warn!(
+                    path = %path.display(),
+                    id = %entry.id,
+                    "quarantined"
+                );
+            }
+            Err(e) => {
+                inner.counters.quarantine_failures.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(path = %path.display(), error = %e, "quarantine failed");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use redoubt_core::sigindex::{Group, IndexBuilder};
+    use redoubt_core::sigs::{HashSig, HashValue};
+
+    const SAMPLE: &[u8] = b"REDOUBT-REALTIME-TEST-SAMPLE-not-real-malware";
+
+    struct Fixture {
+        dir: PathBuf,
+        protection: Protection,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.protection.stop();
+            std::fs::remove_dir_all(&self.dir).ok();
+        }
+    }
+
+    fn fixture(tag: &str, mode: Mode) -> Fixture {
+        let dir = std::env::temp_dir().join(format!("redoubt-rt-{tag}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        for sub in ["signatures", "rules", "quarantine", "watch", "logs", "cache"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+
+        let mut b = IndexBuilder::new(9001, 0);
+        b.add_hash(
+            HashSig {
+                hash: HashValue::from_hex(
+                    &redoubt_core::hashing::digest_bytes(SAMPLE).sha256_value().to_string(),
+                )
+                .unwrap(),
+                size: Some(SAMPLE.len() as u64),
+                name: "Redoubt.Test.RealtimeSample".into(),
+            },
+            Group::File,
+        );
+        b.write(&dir.join("signatures/redoubt.sigidx")).unwrap();
+
+        let mut cfg = Config::default();
+        cfg.mode = mode;
+        cfg.paths.signatures = dir.join("signatures");
+        cfg.paths.rules = dir.join("rules");
+        cfg.paths.quarantine = dir.join("quarantine");
+        cfg.exclusions.paths = Vec::new();
+        cfg.realtime.watch_paths = vec![dir.join("watch")];
+
+        let engine = Arc::new(ScanEngine::load(cfg.clone()).unwrap());
+        Fixture { dir, protection: Protection::new(cfg, engine) }
+    }
+
+    #[test]
+    fn a_malicious_file_is_detected_in_observe_mode() {
+        let f = fixture("observe", Mode::Observe);
+        let victim = f.dir.join("watch").join("sample.bin");
+        std::fs::write(&victim, SAMPLE).unwrap();
+
+        f.protection.submit(victim.clone());
+        f.protection.drain_for_test();
+
+        let recent = f.protection.recent();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].severity, Severity::Malicious);
+        assert_eq!(recent[0].primary_name(), Some("Redoubt.Test.RealtimeSample"));
+
+        // The whole point of observe mode.
+        assert!(victim.exists(), "observe mode must not touch the file");
+        assert!(f.protection.quarantine().held().is_empty());
+        assert_eq!(f.protection.status().counters.quarantined, 0);
+    }
+
+    #[test]
+    fn enforce_mode_quarantines_a_malicious_file() {
+        let f = fixture("enforce", Mode::Enforce);
+        let victim = f.dir.join("watch").join("sample.bin");
+        std::fs::write(&victim, SAMPLE).unwrap();
+
+        f.protection.submit(victim.clone());
+        f.protection.drain_for_test();
+
+        assert!(!victim.exists(), "enforce mode should have removed it");
+        let held = f.protection.quarantine().held();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].original_path, victim);
+        assert_eq!(f.protection.status().counters.quarantined, 1);
+
+        // And it is recoverable.
+        f.protection.quarantine().restore(&held[0].id).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), SAMPLE);
+    }
+
+    #[test]
+    fn a_clean_file_is_ignored_in_both_modes() {
+        for mode in [Mode::Observe, Mode::Enforce] {
+            let f = fixture(&format!("clean{}", mode.as_str()), mode);
+            let ok = f.dir.join("watch").join("notes.txt");
+            std::fs::write(&ok, b"just some ordinary notes").unwrap();
+
+            f.protection.submit(ok.clone());
+            f.protection.drain_for_test();
+
+            assert!(ok.exists());
+            assert!(f.protection.recent().is_empty(), "a clean file must not be reported");
+            assert!(f.protection.quarantine().held().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_suspicious_file_is_never_quarantined_even_when_enforcing() {
+        // The safety property, end to end: enforcement is on, the file is
+        // flagged, and it still must not be touched.
+        let f = fixture("suspicious", Mode::Enforce);
+        let victim = f.dir.join("watch").join("invoice.pdf.exe");
+        std::fs::write(&victim, b"totally harmless content").unwrap();
+
+        f.protection.submit(victim.clone());
+        f.protection.drain_for_test();
+
+        let recent = f.protection.recent();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].severity, Severity::Suspicious);
+        assert!(victim.exists(), "a suspicious file must survive enforce mode");
+        assert!(f.protection.quarantine().held().is_empty());
+    }
+
+    #[test]
+    fn the_cache_prevents_a_rescan_of_an_unchanged_file() {
+        let f = fixture("cache", Mode::Observe);
+        let victim = f.dir.join("watch").join("sample.bin");
+        std::fs::write(&victim, SAMPLE).unwrap();
+
+        for _ in 0..5 {
+            f.protection.submit(victim.clone());
+            f.protection.drain_for_test();
+        }
+
+        let c = f.protection.status().counters;
+        assert_eq!(c.scanned, 1, "the file should have been read exactly once");
+        assert_eq!(c.cache_hits, 4);
+    }
+
+    #[test]
+    fn status_is_honest_about_not_running() {
+        let f = fixture("status", Mode::Observe);
+        let s = f.protection.status();
+        assert!(!s.running);
+        assert!(s.watching.is_empty(), "nothing is being watched while stopped");
+        assert!(
+            s.note.contains("not running"),
+            "status must not imply protection that is not there: {}",
+            s.note
+        );
+    }
+
+    #[test]
+    fn status_never_claims_pre_execution_blocking() {
+        let f = fixture("claims", Mode::Enforce);
+        f.protection.start().unwrap();
+        let s = f.protection.status();
+        assert!(s.running);
+        assert!(
+            s.note.contains("minifilter") && s.note.contains("not built"),
+            "the note must state the limitation: {}",
+            s.note
+        );
+        f.protection.stop();
+    }
+
+    #[test]
+    fn a_full_queue_drops_rather_than_blocking() {
+        let f = fixture("backpressure", Mode::Observe);
+        // Never started, so nothing drains: the queue fills and then refuses.
+        let mut accepted = 0;
+        for i in 0..100_000 {
+            if f.protection.submit(f.dir.join(format!("watch/f{i}.bin"))) {
+                accepted += 1;
+            } else {
+                break;
+            }
+        }
+        assert!(accepted > 0);
+        assert!(
+            f.protection.status().counters.dropped > 0,
+            "a full queue must drop and count, not block"
+        );
+    }
+
+    #[test]
+    fn start_and_stop_are_idempotent() {
+        let f = fixture("idempotent", Mode::Observe);
+        f.protection.start().unwrap();
+        f.protection.start().unwrap();
+        assert!(f.protection.is_running());
+        f.protection.stop();
+        f.protection.stop();
+        assert!(!f.protection.is_running());
+    }
+}

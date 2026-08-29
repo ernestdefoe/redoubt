@@ -12,12 +12,14 @@
 //! - [`sigindex`] - the compiled, memory-mapped index those parsers feed
 
 pub mod bodyscan;
+pub mod cache;
 pub mod compile;
 pub mod config;
 pub mod cvd;
 pub mod hashing;
 pub mod heuristics;
 pub mod pe;
+pub mod quarantine;
 pub mod rules;
 pub mod rulesupdate;
 pub mod scanner;

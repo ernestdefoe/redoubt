@@ -111,6 +111,13 @@ pub struct Realtime {
     /// provider DLL to be registered separately.
     #[serde(default = "default_true")]
     pub amsi: bool,
+    /// Directories watched for changes. Empty means "pick the usual places" -
+    /// Downloads, Desktop, Documents, %TEMP% and %LOCALAPPDATA%.
+    ///
+    /// Watching the whole disk is deliberately not the default: `C:\Windows`
+    /// only changes through Windows Update, and a build tree generates
+    /// enormous churn with no security value.
+    pub watch_paths: Vec<PathBuf>,
     /// How many scan workers to run. 0 = one per core less one, capped at 8.
     pub workers: usize,
     /// Bound on the pending-scan queue. Past this, the oldest low-priority
@@ -126,6 +133,7 @@ impl Default for Realtime {
             file_events: true,
             process_events: true,
             amsi: true,
+            watch_paths: Vec::new(),
             workers: 0,
             queue_capacity: 8192,
         }

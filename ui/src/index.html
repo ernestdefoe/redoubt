@@ -414,11 +414,17 @@
           <div class="flex items-center gap-2">
             <span id="rt-dot" class="status status-warning"></span>
             <span class="text-sm font-medium">Real-time</span>
-            <span id="rt-state" class="ml-auto text-xs opacity-60">off</span>
+            <input id="rt-toggle" type="checkbox" class="toggle toggle-xs ml-auto" aria-label="Toggle real-time protection" />
           </div>
           <p id="rt-note" class="mt-1 text-[11px] leading-snug opacity-55">
-            On-demand scanning only. The resident service is not installed yet.
+            On-demand scanning only.
           </p>
+          <dl id="rt-counters" class="mt-2 hidden grid-cols-2 gap-x-3 gap-y-0.5 text-[11px]">
+            <dt class="opacity-50">watching</dt><dd class="tnum text-right" id="rt-watching">0</dd>
+            <dt class="opacity-50">scanned</dt><dd class="tnum text-right" id="rt-scanned">0</dd>
+            <dt class="opacity-50">cache hits</dt><dd class="tnum text-right" id="rt-cache">0</dd>
+            <dt class="opacity-50">detections</dt><dd class="tnum text-right" id="rt-detections">0</dd>
+          </dl>
         </div>
       </div>
     </aside>

@@ -132,6 +132,11 @@ function goto(page) {
 
 let STATUS = null;
 let CONFIG = null;
+/// Findings from the last on-demand scan.
+let SCAN_FINDINGS = [];
+/// Findings the resident watcher has reported.
+let RT_FINDINGS = [];
+/// The union of both, which is what every view renders.
 let FINDINGS = [];
 let FILTER = "all";
 let activeJob = null;
@@ -170,12 +175,7 @@ function renderStatus(s) {
     ? "Malicious files will be quarantined."
     : "Detections are reported only. Nothing is quarantined or removed.";
 
-  // Real-time state in the sidebar. This is honest about not being built yet
-  // rather than showing a green light for something that is not running.
-  const rt = s.realtime;
-  $("#rt-state").textContent = rt.running ? "on" : "off";
-  $("#rt-dot").className = `status ${rt.running ? "status-success" : "status-warning"}`;
-  $("#rt-note").textContent = rt.note;
+  renderRealtime(s.realtime);
 
   // Presets
   $("#scan-presets").innerHTML = s.presets
@@ -220,6 +220,65 @@ function renderStatus(s) {
 
   renderSources(s);
   renderGaps(s.gaps);
+}
+
+/** Sidebar real-time panel.
+ *
+ *  The dot is green only when protection is genuinely running, and the note is
+ *  whatever the service says about its own limits - the page never invents a
+ *  reassuring message of its own. */
+function renderRealtime(rt) {
+  const running = !!rt.running;
+  $("#rt-toggle").checked = running;
+  $("#rt-dot").className = `status ${running ? "status-success" : "status-warning"}`;
+  $("#rt-note").textContent = rt.note ?? "";
+
+  const counters = $("#rt-counters");
+  counters.classList.toggle("hidden", !running);
+  counters.classList.toggle("grid", running);
+  if (running) {
+    const c = rt.counters ?? {};
+    $("#rt-watching").textContent = num((rt.watching ?? []).length);
+    $("#rt-scanned").textContent = num(c.scanned ?? 0);
+    $("#rt-cache").textContent = num(c.cache_hits ?? 0);
+    const detections = (c.malicious ?? 0) + (c.suspicious ?? 0);
+    $("#rt-detections").textContent = num(detections);
+    $("#rt-detections").className = `tnum text-right${detections > 0 ? " text-error" : ""}`;
+  }
+
+  // Poll while running so the counters move; stop entirely when it is off, so
+  // an idle page makes no requests at all.
+  clearTimeout(realtimeTimer);
+  if (running) {
+    realtimeTimer = setTimeout(refreshRealtime, 2000);
+  }
+}
+
+let realtimeTimer = null;
+
+async function refreshRealtime() {
+  try {
+    const [s, found] = await Promise.all([
+      api.get("/api/status"),
+      api.get("/api/realtime/findings"),
+    ]);
+    const before = RT_FINDINGS.length;
+    RT_FINDINGS = found;
+    renderRealtime(s.realtime);
+    if (found.length !== before) {
+      renderFindings();
+      const fresh = found.length - before;
+      if (fresh > 0) {
+        const worst = found[0];
+        toast(
+          `Real-time: ${worst.severity} \u2014 ${worst.path.split(/[\\/]/).pop()}`,
+          worst.severity === "malicious" ? "error" : "warning",
+        );
+      }
+    }
+  } catch {
+    // A failed poll is not worth a toast; the next one will report it.
+  }
 }
 
 function renderSources(s) {
@@ -304,7 +363,25 @@ function findingsTable(list, { compact = false } = {}) {
     </table>`;
 }
 
+/** Merge the two sources of findings.
+ *
+ *  Real-time detections and on-demand scan results are separate streams, and
+ *  showing only one of them is how the sidebar ends up reporting a detection
+ *  while the findings list claims nothing was found. Deduplicated on path plus
+ *  content hash, so rescanning the same file does not double up. */
+function mergeFindings() {
+  const seen = new Map();
+  for (const v of [...RT_FINDINGS, ...SCAN_FINDINGS]) {
+    seen.set(`${v.path}\u0000${v.identity?.sha256 ?? ""}`, v);
+  }
+  FINDINGS = [...seen.values()].sort(
+    (a, b) =>
+      (SEVERITY[b.severity]?.rank ?? 0) - (SEVERITY[a.severity]?.rank ?? 0),
+  );
+}
+
 function renderFindings() {
+  mergeFindings();
   const list =
     FILTER === "all" ? FINDINGS : FINDINGS.filter((f) => f.severity === FILTER);
   $("#findings-table").innerHTML = findingsTable(list);
@@ -496,7 +573,7 @@ async function pollJob(id) {
   busy(false);
 
   if (job.kind === "scan") {
-    FINDINGS = job.findings ?? [];
+    SCAN_FINDINGS = job.findings ?? [];
     renderFindings();
     const n = job.malicious;
     toast(
@@ -531,12 +608,15 @@ async function startJob(url, body, label) {
 
 async function refresh() {
   try {
-    const [status, cfg] = await Promise.all([
+    const [status, cfg, rtFindings] = await Promise.all([
       api.get("/api/status"),
       api.get("/api/config"),
+      api.get("/api/realtime/findings").catch(() => []),
     ]);
+    RT_FINDINGS = rtFindings;
     renderStatus(status);
     renderConfig(cfg);
+    renderFindings();
   } catch (e) {
     toast(`Cannot reach the Redoubt service: ${e.message}`, "error");
   }
@@ -597,6 +677,22 @@ function wire() {
   $("#btn-update-all").addEventListener("click", () =>
     startJob("/api/db/update", {}, "Updating signatures…"),
   );
+
+  $("#rt-toggle").addEventListener("change", async (ev) => {
+    const on = ev.target.checked;
+    try {
+      const rt = await api.post(`/api/realtime/${on ? "start" : "stop"}`);
+      renderRealtime(rt);
+      toast(
+        on ? `Real-time protection on, watching ${rt.watching.length} location(s)` : "Real-time protection off",
+        on ? "success" : "info",
+      );
+    } catch (e) {
+      // Put the switch back: it must never show a state the service is not in.
+      ev.target.checked = !on;
+      toast(e.message, "error");
+    }
+  });
 
   $("#toggle-enforce").addEventListener("change", async (ev) => {
     const mode = ev.target.checked ? "enforce" : "observe";
