@@ -88,15 +88,28 @@ impl FileKind {
     }
 
     /// Whether a pattern declared for `target` may fire on this file.
+    ///
+    /// ClamAV's target types are not decoration. A signature tagged `graphics`
+    /// says "this byte pattern identifies a malicious *image*" - firing it on
+    /// a Windows DLL is not a detection, it is a misreading of what the
+    /// signature author wrote. `Html.Spyware.IMG-10` is tagged graphics and
+    /// matched `C:\Windows\System32\en-US\ieframe.dll.mui`, a resource-only
+    /// PE, which is exactly the shape of that mistake.
+    ///
+    /// So: a target we cannot sniff for is still allowed on content whose type
+    /// we do not know - a signature that can never fire is invisible, which is
+    /// worse than one that occasionally misfires. But it is refused on a file
+    /// we have positively identified as something else.
     fn accepts(&self, target: Target) -> bool {
         match target {
             Target::Any => true,
             Target::PortableExecutable => self.is_pe,
             Target::Elf => self.is_elf,
-            // Types we do not sniff for are allowed through rather than
-            // silently suppressed - a false positive is recoverable, a
-            // signature that can never fire is invisible.
-            _ => true,
+            // None of the remaining ClamAV target types is a PE or an ELF:
+            // OLE, HTML, mail, graphics, text, and everything numbered above
+            // them (Mach-O, PDF, Flash, Java...). If we know the file is a
+            // binary executable, none of them applies to it.
+            _ => !(self.is_pe || self.is_elf),
         }
     }
 }
@@ -481,6 +494,35 @@ mod tests {
         let mut pe = b"MZ".to_vec();
         pe.extend_from_slice(PAT_A);
         assert!(s.scan(&pe, FileKind::sniff(&pe), 16).is_empty());
+    }
+
+    #[test]
+    fn a_graphics_signature_does_not_fire_on_a_windows_binary() {
+        // The real false positive this rule exists for: `Html.Spyware.IMG-10`
+        // is tagged target 5 (graphics) and matched
+        // C:\Windows\System32\en-US\ieframe.dll.mui - a resource-only PE.
+        // A signature that identifies a malicious *image* says nothing about
+        // a DLL that happens to contain the same bytes.
+        let pe = FileKind::sniff(b"MZ this is a windows binary image");
+        assert!(!pe.accepts(Target::Graphics));
+        assert!(!pe.accepts(Target::Html));
+        assert!(!pe.accepts(Target::OleDocument));
+        assert!(!pe.accepts(Target::Mail));
+        assert!(!pe.accepts(Target::AsciiText));
+        assert!(!pe.accepts(Target::Other(10)), "PDF signatures are not PE signatures");
+    }
+
+    #[test]
+    fn an_unsniffable_target_still_fires_on_unknown_content() {
+        // The other half of the bargain. We cannot tell an HTML file from a
+        // text file, so on content we have not identified those signatures
+        // must still work - a signature that can never fire is invisible,
+        // which is worse than one that occasionally misfires.
+        let unknown = FileKind::sniff(b"<html><body>some page content here</body></html>");
+        assert!(unknown.accepts(Target::Html));
+        assert!(unknown.accepts(Target::Graphics));
+        assert!(unknown.accepts(Target::Any));
+        assert!(!unknown.accepts(Target::PortableExecutable));
     }
 
     #[test]

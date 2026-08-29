@@ -60,7 +60,7 @@ Worth knowing before you install it, so nothing here is a surprise:
 | Filesystem minifilter (pre-execution blocking) | Not built |
 | Network C2 blocking | **Working** — WFP, no driver needed |
 
-372 tests.
+374 tests.
 
 ---
 
@@ -76,6 +76,12 @@ Five engines, each independently switchable:
 5. **Heuristics** — entropy, writable+executable sections, minimal imports,
    filename tricks. These **only ever produce `suspicious`**, and
    `Severity::is_actionable()` structurally bars them from enforcement.
+
+ClamAV's target types are honoured: a signature tagged `graphics` says "this
+pattern identifies a malicious *image*", and firing it on a Windows DLL is a
+misreading of what its author wrote, not a detection. Targets we cannot sniff
+for still apply to content whose type is unknown — a signature that can never
+fire is invisible, which is worse than one that occasionally misfires.
 
 Signatures in ClamAV's `PUA.` namespace map to `suspicious` rather than
 `malicious` — Windows' own `MRT.exe` trips two packer signatures, and reporting
