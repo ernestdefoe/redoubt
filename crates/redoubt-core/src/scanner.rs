@@ -217,6 +217,46 @@ impl ScanSession<'_> {
 
     /// Scan an in-memory buffer. `path` is used for name-based heuristics and
     /// for reporting only; it need not exist on disk.
+    /// Scan a UTF-8 rendering of UTF-16 content.
+    ///
+    /// Content engines only. Hashes are deliberately excluded: the digest of
+    /// a transcoded copy is the digest of something that was never on disk,
+    /// so a hit would be meaningless and a miss tells us nothing. Heuristics
+    /// are excluded for the same reason - they describe a file's shape, and
+    /// this is not the file.
+    fn scan_decoded(&mut self, path: &Path, text: &[u8]) -> Vec<Detection> {
+        let cfg = &self.engine.cfg;
+        let mut out = Vec::new();
+
+        if cfg.engines.body_pattern && !self.engine.body.is_empty() {
+            let kind = FileKind::sniff(text);
+            for m in self.engine.body.scan(text, kind, MAX_BODY_MATCHES) {
+                let severity = crate::sigs::implied_severity(&m.name);
+                out.push(
+                    Detection::new(m.name, Engine::BodyPattern, severity)
+                        // Said plainly. Somebody looking at an offset that
+                        // does not exist in the file on disk deserves to know
+                        // why rather than conclude the tool is broken.
+                        .with_detail(format!("matched at offset {} after decoding UTF-16", m.offset)),
+                );
+            }
+        }
+
+        if let Some(yara) = self.yara.as_mut() {
+            match yara.scan(text) {
+                Ok(hits) => out.extend(hits.iter().map(|h| h.to_detection())),
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(), error = %e,
+                        "YARA scan of decoded UTF-16 failed"
+                    );
+                }
+            }
+        }
+
+        out
+    }
+
     pub fn scan_bytes(&mut self, path: &Path, data: &[u8]) -> Verdict {
         let started = Instant::now();
         let cfg = &self.engine.cfg;
@@ -330,6 +370,26 @@ impl ScanSession<'_> {
                 // coverage for this file.
                 for limit in &extraction.limits_hit {
                     verdict.archive_limits.push(limit.to_string());
+                }
+            }
+        }
+
+        // --- 6b. The same content, decoded from UTF-16 ---
+        //
+        // Every signature is ASCII or UTF-8. UTF-16 text interleaves a zero
+        // byte with every character, so none of them can match it - the scan
+        // above runs, finds nothing, and reports clean. That is the default
+        // encoding for PowerShell script text and for anything `Out-File`
+        // writes, so without this pass a whole class of content is invisible
+        // rather than merely harder to see.
+        //
+        // In addition to the raw bytes, never instead of them: content that
+        // is genuinely UTF-16 on the wire must still match a UTF-16
+        // signature, and a .NET assembly is real PE bytes.
+        if cfg.engines.body_pattern || cfg.engines.yara {
+            if let Some(text) = crate::textform::transcode_if_utf16(data) {
+                for d in self.scan_decoded(path, text.as_bytes()) {
+                    verdict.detections.push(d);
                 }
             }
         }
@@ -639,6 +699,66 @@ mod tests {
         let d = v.detections.iter().find(|d| d.engine == Engine::Yara).unwrap();
         assert_eq!(d.name, "Redoubt_Test_Yara");
         assert_eq!(v.severity, Severity::Malicious);
+    }
+
+    #[test]
+    fn utf16_content_is_detected_by_an_ascii_signature() {
+        // The bug this pass exists for. A body-pattern signature is written
+        // in ASCII; the same text encoded as UTF-16 shares not one byte run
+        // with it, so before decoding this scanned clean - which is exactly
+        // what PowerShell hands to AMSI, and what `Out-File` writes to disk.
+        let f = fixture("utf16");
+        let mut session = f.engine.session();
+
+        let text = format!(
+            "$u = 'harmless'
+# {}
+Write-Output 'x'
+",
+            String::from_utf8_lossy(BODY_MARKER)
+        );
+
+        let plain = session.scan_bytes(Path::new("probe.ps1"), text.as_bytes());
+        assert_eq!(plain.severity, Severity::Malicious, "the ASCII form must match");
+
+        let wide: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        assert!(
+            !wide.windows(BODY_MARKER.len()).any(|w| w == BODY_MARKER),
+            "the premise: the ASCII bytes are simply absent from the UTF-16 form"
+        );
+
+        let decoded = session.scan_bytes(Path::new("probe.ps1"), &wide);
+        assert_eq!(
+            decoded.severity,
+            Severity::Malicious,
+            "the same text in UTF-16 must match too"
+        );
+        assert!(
+            decoded
+                .detections
+                .iter()
+                .any(|d| d.detail.as_deref().is_some_and(|t| t.contains("after decoding UTF-16"))),
+            "a finding must say why its offset is not in the file"
+        );
+    }
+
+    #[test]
+    fn a_binary_is_not_put_through_the_decoder() {
+        // The decoded pass must not invent findings on content that merely
+        // has a lot of zero bytes in it.
+        let f = fixture("utf16-binary");
+        let mut session = f.engine.session();
+
+        let mut sparse = vec![0u8; 2048];
+        sparse[0] = b'M';
+        sparse[1] = b'Z';
+        let v = session.scan_bytes(Path::new("sparse.bin"), &sparse);
+        assert!(
+            !v.detections
+                .iter()
+                .any(|d| d.detail.as_deref().is_some_and(|t| t.contains("UTF-16"))),
+            "padding is not text"
+        );
     }
 
     #[test]

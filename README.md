@@ -34,7 +34,7 @@ anything until you explicitly turn enforcement on.
 | Filesystem minifilter (pre-execution blocking) | Not built |
 | Network C2 blocking | Not built |
 
-330 tests.
+349 tests.
 
 ---
 

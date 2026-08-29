@@ -269,6 +269,41 @@ fn status_json(app: &App) -> serde_json::Value {
     })
 }
 
+/// The complete set of things the interface may ask for elevation to do.
+///
+/// A fixed table, not a passthrough. The page sends a name; nothing it sends
+/// ever reaches a command line unexamined.
+fn elevated_task(name: &str) -> Option<(&'static [&'static str], &'static str)> {
+    Some(match name {
+        "amsi-install" => (&["amsi-install"], "Enabling script scanning"),
+        "amsi-uninstall" => (&["amsi-uninstall"], "Disabling script scanning"),
+        "service-install" => (&["install"], "Installing the background service"),
+        "service-uninstall" => (&["uninstall"], "Removing the background service"),
+        "service-start" => (&["start"], "Starting the background service"),
+        "service-stop" => (&["stop"], "Stopping the background service"),
+        _ => return None,
+    })
+}
+
+/// The Windows service, as the page needs to see it.
+fn service_json() -> serde_json::Value {
+    use redoubt_service::install::Installed;
+    match redoubt_service::install::status() {
+        Installed::Yes { running, image } => json!({
+            "installed": true,
+            "running": running,
+            "image": image.map(|p| p.display().to_string()),
+        }),
+        Installed::No => json!({ "installed": false, "running": false, "image": null }),
+        // Reported rather than flattened to "no": claiming a service is absent
+        // when we could not look invites someone to install a second one.
+        Installed::Unknown(e) => json!({
+            "installed": null, "running": false, "image": null,
+            "error": e.to_string(),
+        }),
+    }
+}
+
 /* ────────────────────────────  workers  ──────────────────────────── */
 
 fn spawn_scan(app: Arc<App>, id: u64, handle: jobs::JobHandle, root: PathBuf) {
@@ -371,6 +406,49 @@ fn spawn_db_update(app: Arc<App>, id: u64, handle: jobs::JobHandle) {
                 JobState::Error
             }
         };
+        app.jobs.finish(id, state);
+    });
+}
+
+/// Run an elevated task and report how it went.
+///
+/// The consent dialog blocks this thread for as long as it takes somebody to
+/// answer it, which is why it is a job rather than a request handler.
+fn spawn_elevated(
+    app: Arc<App>,
+    id: u64,
+    handle: jobs::JobHandle,
+    args: &'static [&'static str],
+    label: &'static str,
+) {
+    std::thread::spawn(move || {
+        handle.lock().current = "Waiting for Windows to ask permission...".into();
+
+        let Some(exe) = redoubt_service::elevate::redoubtd_path() else {
+            handle.lock().error = Some(
+                "Could not find redoubtd.exe, which does the work that needs                  administrator rights. It should sit beside this program."
+                    .into(),
+            );
+            app.jobs.finish(id, JobState::Error);
+            return;
+        };
+
+        let outcome = redoubt_service::elevate::run_elevated(&exe, args);
+        let mut job = handle.lock();
+        job.summary = Some(outcome.message(label));
+
+        // Declining is not an error. The machine is exactly as it was, and
+        // colouring it red sends someone hunting for a problem that is not
+        // there.
+        let state = match &outcome {
+            redoubt_service::elevate::Outcome::Completed { exit_code: 0 } => JobState::Done,
+            redoubt_service::elevate::Outcome::Declined => JobState::Cancelled,
+            _ => {
+                job.error = Some(outcome.message(label));
+                JobState::Error
+            }
+        };
+        drop(job);
         app.jobs.finish(id, state);
     });
 }
@@ -629,6 +707,31 @@ fn handle(app: &Arc<App>, request: &mut tiny_http::Request) -> tiny_http::Respon
                 None => json_response(json!({ "error": "another job is running" }), 409),
             }
         }
+
+        // Everything that needs administrator rights goes through one route,
+        // so there is exactly one place that decides what the interface is
+        // allowed to ask for. The task name is matched against a fixed list -
+        // it is never passed through to a shell, and an unknown one is
+        // refused rather than attempted.
+        (Method::Post, path) if path.starts_with("/api/elevate/") => {
+            let task = path.trim_start_matches("/api/elevate/");
+            match elevated_task(task) {
+                Some((args, label)) => {
+                    match app.jobs.start(JobKind::Elevate, label) {
+                        Some((id, handle)) => {
+                            spawn_elevated(app.clone(), id, handle, args, label);
+                            json_response(json!({ "id": id }), 200)
+                        }
+                        None => {
+                            json_response(json!({ "error": "another job is running" }), 409)
+                        }
+                    }
+                }
+                None => json_response(json!({ "error": "unknown task" }), 400),
+            }
+        }
+
+        (Method::Get, "/api/service") => json_response(service_json(), 200),
 
         (Method::Post, "/api/db/update") => match app.jobs.start(JobKind::Db, "Updating signatures") {
             Some((id, handle)) => {

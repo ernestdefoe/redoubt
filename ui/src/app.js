@@ -249,6 +249,72 @@ function renderStatus(s) {
   renderGaps(s.gaps);
 }
 
+/** The two things that need administrator rights, in Settings.
+ *
+ * Both are stated as what they do rather than what they are: nobody outside
+ * this codebase should have to know what AMSI or a Windows service is to
+ * decide whether they want protection on.
+ */
+function renderSetup(status, svc) {
+  const ch = status?.realtime?.scan_channel;
+  const registered = !!ch?.provider_registered;
+
+  $("#setup-amsi-badge").textContent = registered ? "on" : "off";
+  $("#setup-amsi-badge").className = `badge badge-sm ${registered ? "badge-success" : "badge-ghost"}`;
+  $("#setup-amsi-label").textContent = registered ? "Turn off" : "Turn on";
+  $("#setup-amsi-btn").className = `btn btn-sm shrink-0 gap-1.5 ${registered ? "" : "btn-primary"}`;
+  $("#setup-amsi-note").textContent = registered
+    ? ch?.listening
+      ? "Checking PowerShell, Office macros and .NET before they run."
+      : "Registered, but waiting on protection to start. Turn on Real-time."
+    : "Checks PowerShell, Office macros and .NET before they run.";
+
+  // `installed` is deliberately three-valued: null means we could not look,
+  // and saying "not installed" then would invite installing a second one.
+  const installed = svc?.installed;
+  const running = !!svc?.running;
+  const badge = $("#setup-svc-badge");
+
+  if (installed === true) {
+    badge.textContent = running ? "running" : "installed, stopped";
+    badge.className = `badge badge-sm ${running ? "badge-success" : "badge-warning"}`;
+    $("#setup-svc-label").textContent = "Remove";
+    $("#setup-svc-btn").className = "btn btn-sm gap-1.5";
+    $("#setup-svc-note").textContent = running
+      ? "Protection runs in the background, before anyone signs in."
+      : "Installed but not running.";
+    $("#setup-svc-run").classList.remove("hidden");
+    $("#setup-svc-run").textContent = running ? "Stop" : "Start";
+    $("#setup-svc-run").dataset.task = running ? "service-stop" : "service-start";
+  } else if (installed === false) {
+    badge.textContent = "not installed";
+    badge.className = "badge badge-ghost badge-sm";
+    $("#setup-svc-label").textContent = "Install";
+    $("#setup-svc-btn").className = "btn btn-sm btn-primary gap-1.5";
+    $("#setup-svc-note").textContent =
+      "Runs protection in the background, before anyone signs in.";
+    $("#setup-svc-run").classList.add("hidden");
+  } else {
+    badge.textContent = "unknown";
+    badge.className = "badge badge-ghost badge-sm";
+    $("#setup-svc-label").textContent = "Install";
+    $("#setup-svc-btn").className = "btn btn-sm gap-1.5";
+    $("#setup-svc-note").textContent =
+      svc?.error ?? "Could not read the service state on this machine.";
+    $("#setup-svc-run").classList.add("hidden");
+  }
+
+  SETUP = { registered, installed, running };
+}
+
+/** What the setup buttons should do next. Set by renderSetup. */
+let SETUP = { registered: false, installed: false, running: false };
+
+/** Ask for elevation. Windows shows its own dialog; we only report the answer. */
+function elevate(task, label) {
+  startJob(`/api/elevate/${task}`, null, label);
+}
+
 /** Script scanning: the AMSI provider plus the pipe it talks to.
  *
  * Two independent halves, and either one missing means scripts are not being
@@ -291,6 +357,10 @@ function renderScriptScanning(ch) {
     note.textContent =
       "PowerShell, Office macros and .NET are not being checked.";
   }
+
+  // Offer the fix only when registering is actually the missing piece.
+  // "No service" is fixed by the real-time toggle, not by another UAC prompt.
+  $("#amsi-enable").classList.toggle("hidden", registered);
 
   const counters = $("#amsi-counters");
   counters.classList.toggle("hidden", !active);
@@ -868,7 +938,10 @@ async function pollJob(id) {
       n > 0 ? "error" : "success",
     );
   } else {
-    if (job.error) toast(job.error, "error");
+    // Declining a consent dialog changes nothing, so it must not be
+    // coloured like a failure - that sends people hunting for a problem.
+    if (job.state === "cancelled") toast(job.summary ?? "Cancelled", "warning");
+    else if (job.error) toast(job.error, "error");
     else toast(job.summary ?? "Done", "success");
     await refresh();
   }
@@ -893,15 +966,19 @@ async function startJob(url, body, label) {
 
 async function refresh() {
   try {
-    const [status, cfg, rtFindings] = await Promise.all([
+    const [status, cfg, rtFindings, svc] = await Promise.all([
       api.get("/api/status"),
       api.get("/api/config"),
       api.get("/api/realtime/findings").catch(() => []),
+      // Reading the service state can fail on a locked-down machine. That is
+      // worth showing as "unknown", not worth failing the whole page over.
+      api.get("/api/service").catch((e) => ({ installed: null, error: e.message })),
     ]);
     RT_FINDINGS = rtFindings;
     renderStatus(status);
     renderConfig(cfg);
     renderFindings();
+    renderSetup(status, svc);
   } catch (e) {
     toast(`Cannot reach the Redoubt service: ${e.message}`, "error");
   }
@@ -1030,6 +1107,27 @@ function wire() {
       toggle.checked = !enable;
       toast(e.message, "error");
     }
+  });
+
+  $("#amsi-enable").addEventListener("click", () =>
+    elevate("amsi-install", "Enabling script scanning"),
+  );
+
+  $("#setup-amsi-btn").addEventListener("click", () =>
+    SETUP.registered
+      ? elevate("amsi-uninstall", "Disabling script scanning")
+      : elevate("amsi-install", "Enabling script scanning"),
+  );
+
+  $("#setup-svc-btn").addEventListener("click", () =>
+    SETUP.installed === true
+      ? elevate("service-uninstall", "Removing the background service")
+      : elevate("service-install", "Installing the background service"),
+  );
+
+  $("#setup-svc-run").addEventListener("click", (e) => {
+    const task = e.currentTarget.dataset.task;
+    if (task) elevate(task, task === "service-stop" ? "Stopping" : "Starting");
   });
 
   $("#ransom-dismiss").addEventListener("click", () => {

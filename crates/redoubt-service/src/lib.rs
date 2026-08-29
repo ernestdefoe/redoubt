@@ -22,6 +22,7 @@
 //! nonsense. Paths are therefore held for a short settle period and coalesced,
 //! so one copy costs one scan.
 
+pub mod elevate;
 pub mod install;
 pub mod ipc;
 pub mod process;

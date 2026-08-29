@@ -28,6 +28,7 @@ pub mod scanner;
 pub mod sigindex;
 pub mod sigs;
 pub mod update;
+pub mod textform;
 pub mod verdict;
 
 pub use config::{Config, Mode};

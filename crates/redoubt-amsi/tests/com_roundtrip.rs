@@ -182,6 +182,21 @@ unsafe fn scan(provider: *mut c_void, stream: &mut FakeStream) -> u32 {
     result
 }
 
+/// Serialises every test in this file.
+///
+///
+/// `OBJECT_COUNT` is process-wide - it has to be, because `DllCanUnloadNow`
+/// answers for the whole DLL. Two tests holding providers at once therefore
+/// see each other's objects, and an exact assertion fails for a reason that
+/// has nothing to do with the code under test. Every test here creates COM
+/// objects, so every one of them takes this - serialising a handful of
+/// microsecond-scale tests costs nothing next to a suite that fails at random.
+static COUNTED: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn counted() -> std::sync::MutexGuard<'static, ()> {
+    COUNTED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 unsafe fn release(provider: *mut c_void) {
     let vtbl = unsafe { &**(provider as *const *const IAntimalwareProviderVtbl) };
     unsafe { (vtbl.base.release)(provider) };
@@ -191,6 +206,7 @@ unsafe fn release(provider: *mut c_void) {
 
 #[test]
 fn the_class_factory_produces_a_working_provider() {
+    let _serial = counted();
     unsafe {
         let provider = create_provider();
 
@@ -214,6 +230,7 @@ fn the_class_factory_produces_a_working_provider() {
 
 #[test]
 fn an_unknown_class_id_is_refused() {
+    let _serial = counted();
     let other = Guid::new(0x1234_5678, 0x1111, 0x2222, [0; 8]);
     let mut out: *mut c_void = std::ptr::null_mut();
     let hr = unsafe { DllGetClassObject(&other, &IID_ICLASSFACTORY, &mut out) };
@@ -223,6 +240,7 @@ fn an_unknown_class_id_is_refused() {
 
 #[test]
 fn an_unsupported_interface_is_refused() {
+    let _serial = counted();
     let mut out: *mut c_void = std::ptr::null_mut();
     let odd = Guid::new(0xDEAD_BEEF, 0, 0, [0; 8]);
     let hr = unsafe { DllGetClassObject(&CLSID_REDOUBT_PROVIDER, &odd, &mut out) };
@@ -232,6 +250,7 @@ fn an_unsupported_interface_is_refused() {
 
 #[test]
 fn aggregation_is_refused_rather_than_ignored() {
+    let _serial = counted();
     // Silently ignoring the outer unknown corrupts the caller's reference
     // counting in ways that surface much later and elsewhere.
     unsafe {
@@ -259,6 +278,7 @@ fn aggregation_is_refused_rather_than_ignored() {
 
 #[test]
 fn scanning_reads_content_through_the_address_attribute() {
+    let _serial = counted();
     unsafe {
         let provider = create_provider();
         let mut stream = fake_stream(b"Write-Host 'ordinary'", true);
@@ -278,6 +298,7 @@ fn scanning_reads_content_through_the_address_attribute() {
 
 #[test]
 fn scanning_falls_back_to_read_when_no_address_is_offered() {
+    let _serial = counted();
     // Hosts differ. A provider that only handles the address path silently
     // sees nothing from the others.
     unsafe {
@@ -297,6 +318,7 @@ fn scanning_falls_back_to_read_when_no_address_is_offered() {
 
 #[test]
 fn an_empty_stream_is_not_detected() {
+    let _serial = counted();
     unsafe {
         let provider = create_provider();
         let mut stream = fake_stream(b"", true);
@@ -307,6 +329,7 @@ fn an_empty_stream_is_not_detected() {
 
 #[test]
 fn a_null_stream_does_not_crash_and_does_not_block() {
+    let _serial = counted();
     // AMSI should never do this, but a provider that faults on bad input takes
     // PowerShell down with it.
     unsafe {
@@ -321,6 +344,7 @@ fn a_null_stream_does_not_crash_and_does_not_block() {
 
 #[test]
 fn a_null_result_pointer_is_refused_rather_than_written_through() {
+    let _serial = counted();
     unsafe {
         let provider = create_provider();
         let vtbl = &**(provider as *const *const IAntimalwareProviderVtbl);
@@ -337,6 +361,7 @@ fn a_null_result_pointer_is_refused_rather_than_written_through() {
 
 #[test]
 fn close_session_is_callable_and_returns_nothing() {
+    let _serial = counted();
     // CloseSession returns void, not HRESULT. If the vtable declared it wrong
     // the call would read a garbage register as a result.
     unsafe {
@@ -350,6 +375,7 @@ fn close_session_is_callable_and_returns_nothing() {
 
 #[test]
 fn the_dll_reports_it_cannot_unload_while_an_object_lives() {
+    let _serial = counted();
     // Unloading while a vtable pointer is still live crashes the host on its
     // next call.
     unsafe {
@@ -362,6 +388,7 @@ fn the_dll_reports_it_cannot_unload_while_an_object_lives() {
 
 #[test]
 fn reference_counting_balances() {
+    let _serial = counted();
     unsafe {
         let provider = create_provider();
         let vtbl = &**(provider as *const *const IAntimalwareProviderVtbl);
@@ -378,6 +405,7 @@ fn reference_counting_balances() {
 
 #[test]
 fn querying_iunknown_from_the_provider_works() {
+    let _serial = counted();
     unsafe {
         let provider = create_provider();
         let vtbl = &**(provider as *const *const IAntimalwareProviderVtbl);

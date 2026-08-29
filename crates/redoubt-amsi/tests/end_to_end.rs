@@ -69,6 +69,27 @@ fn engine_for(dir: &std::path::Path) -> Arc<ScanEngine> {
     Arc::new(ScanEngine::load(cfg).unwrap())
 }
 
+/// Refuse to run if something else already answers on the scan pipe.
+///
+/// The pipe name is fixed by design - the provider DLL is loaded into
+/// processes that know nothing about Redoubt, so it cannot be a setting. That
+/// means a Redoubt service running on this machine answers these tests
+/// instead of the fixture, from an index that knows nothing about the test
+/// signature. The failure that produces is baffling; this one is not.
+fn require_exclusive_pipe() {
+    if std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(ipc::PIPE_NAME)
+        .is_ok()
+    {
+        panic!(
+            "something is already answering on {}. These tests need it to              themselves - stop the running Redoubt service or interface first.",
+            ipc::PIPE_NAME
+        );
+    }
+}
+
 fn temp_dir(tag: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("redoubt-amsi-e2e-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -210,6 +231,8 @@ fn a_malicious_script_is_blocked_through_the_whole_chain() {
     // suite runs in a separate process that would otherwise bind it too.
     let _lock = ipc::testlock::acquire();
 
+    require_exclusive_pipe();
+
     let dir = temp_dir("blocked");
     let engine = engine_for(&dir);
     let mut server = ipc::ScanServer::start(engine).expect("the scan channel should bind");
@@ -239,6 +262,8 @@ fn a_malicious_script_is_blocked_through_the_whole_chain() {
 fn an_ordinary_script_runs() {
     let _lock = ipc::testlock::acquire();
 
+    require_exclusive_pipe();
+
     let dir = temp_dir("clean");
     let engine = engine_for(&dir);
     let mut server = ipc::ScanServer::start(engine).unwrap();
@@ -256,6 +281,8 @@ fn an_ordinary_script_runs() {
 #[test]
 fn a_stopped_service_lets_scripts_run() {
     let _lock = ipc::testlock::acquire();
+
+    require_exclusive_pipe();
 
     let dir = temp_dir("stopped");
     let engine = engine_for(&dir);

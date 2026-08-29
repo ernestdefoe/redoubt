@@ -20,6 +20,11 @@ pub enum JobKind {
     Scan,
     Db,
     Rules,
+    /// Something that needs administrator rights, done by a separate elevated
+    /// process. These finish when a person answers the consent dialog, which
+    /// may be never, so the page shows them differently from work with a
+    /// measurable amount of progress in it.
+    Elevate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

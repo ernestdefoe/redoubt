@@ -34,8 +34,7 @@
 use anyhow::{Context, Result};
 use redoubt_core::scanner::ScanEngine;
 use redoubt_core::verdict::Severity;
-use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Where the pipe lives. Fixed, because the AMSI provider has no configuration
@@ -68,6 +67,10 @@ pub struct IpcCounters {
     pub malicious: AtomicU64,
     pub suspicious: AtomicU64,
     pub errors: AtomicU64,
+    /// Clients turned away at [`MAX_CONCURRENT_CLIENTS`]. Counted separately
+    /// from errors: it is a capacity decision this code made, not a fault, and
+    /// a rising number here means something is hammering the pipe.
+    pub rejected: AtomicU64,
 }
 
 /// Scan one request body and produce the response bytes.
@@ -130,7 +133,7 @@ pub fn encode_request(content: &[u8]) -> Vec<u8> {
 
 /// The running pipe server.
 pub struct ScanServer {
-    stop: Arc<AtomicBool>,
+    stop: Arc<pipe::StopSignal>,
     thread: Option<std::thread::JoinHandle<()>>,
     counters: Arc<IpcCounters>,
 }
@@ -142,7 +145,7 @@ impl ScanServer {
 
     /// Start accepting connections.
     pub fn start(engine: Arc<ScanEngine>) -> Result<Self> {
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(pipe::StopSignal::new().context("creating the stop signal")?);
         let counters = Arc::new(IpcCounters::default());
 
         // Returning before the first pipe instance exists would make
@@ -169,9 +172,14 @@ impl ScanServer {
     }
 
     pub fn stop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        // Wake the blocking ConnectNamedPipe by connecting to it once.
-        let _ = std::fs::OpenOptions::new().read(true).write(true).open(PIPE_NAME);
+        // Signalling an event, not setting a flag: the accept loop spends its
+        // life blocked, and a flag is only ever noticed by code that is
+        // running. An earlier version woke it by connecting to the pipe once,
+        // which fails whenever a second server exists on the same name -
+        // Windows may hand that connection to the other instance, leaving this
+        // one waiting for a client that never comes and `join` blocking
+        // forever.
+        self.stop.signal();
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -184,33 +192,58 @@ impl Drop for ScanServer {
     }
 }
 
+/// Most clients served at once.
+///
+/// The pipe is open to every integrity level by design, so anything on the
+/// machine can connect. One thread per connection is right for the traffic -
+/// AMSI callers are short-lived and infrequent - but only with a ceiling, or
+/// a hostile local process can spawn threads until the service falls over.
+/// Past the ceiling a caller is answered and hung up on rather than queued,
+/// because a queued AMSI caller is a stalled PowerShell prompt.
+const MAX_CONCURRENT_CLIENTS: usize = 32;
+
 fn accept_loop(
     engine: Arc<ScanEngine>,
-    stop: Arc<AtomicBool>,
+    stop: Arc<pipe::StopSignal>,
     counters: Arc<IpcCounters>,
     ready: std::sync::mpsc::SyncSender<()>,
 ) {
     // Fires once, when the first instance exists and a client could connect.
     let mut ready = Some(ready);
-    while !stop.load(Ordering::Relaxed) {
+    let live = Arc::new(AtomicUsize::new(0));
+
+    while !stop.is_set() {
         match pipe::create_and_wait(&stop, &mut || {
             if let Some(tx) = ready.take() {
                 let _ = tx.try_send(());
             }
         }) {
-            Ok(Some(mut conn)) => {
+            Ok(Some(conn)) => {
+                if live.load(Ordering::Relaxed) >= MAX_CONCURRENT_CLIENTS {
+                    counters.rejected.fetch_add(1, Ordering::Relaxed);
+                    // Say something rather than vanish: a client that gets no
+                    // reply has to interpret a timeout, and the answer it
+                    // should reach is the one we can hand it directly.
+                    let _ = conn.write_all(&encode_response(VERDICT_CLEAN, "server busy"));
+                    continue;
+                }
+
                 let engine = engine.clone();
                 let counters = counters.clone();
+                let live = live.clone();
+                live.fetch_add(1, Ordering::Relaxed);
                 // One thread per connection. AMSI callers are short-lived and
                 // infrequent; a pool would be more machinery than the traffic
                 // justifies.
                 let _ = std::thread::Builder::new()
                     .name("redoubt-scan-conn".into())
                     .spawn(move || {
+                        let mut conn = conn;
                         if let Err(e) = serve_one(&engine, &mut conn, &counters) {
                             counters.errors.fetch_add(1, Ordering::Relaxed);
                             tracing::debug!(error = %e, "scan pipe client error");
                         }
+                        live.fetch_sub(1, Ordering::Relaxed);
                     });
             }
             Ok(None) => break, // stopping
@@ -244,116 +277,238 @@ fn serve_one(
 
     let response = handle_request(engine, &content, counters);
     conn.write_all(&response).context("writing response")?;
-    conn.flush().ok();
     Ok(())
 }
 
 /// Named-pipe plumbing.
 ///
-/// `std` has no named-pipe server, so this is the minimum Win32 needed: create
-/// an instance, wait for a client, hand back something implementing `Read` and
-/// `Write`.
+/// `std` has no named-pipe server, so this is the minimum Win32 needed. All of
+/// it is overlapped, for two reasons that both come down to never blocking
+/// forever:
+///
+/// - **Stopping must work.** A blocking `ConnectNamedPipe` can only be woken
+///   by a client connecting. The obvious trick - have `stop()` connect to our
+///   own pipe once - fails the moment a second server exists on the same name,
+///   because Windows may hand that connection to the *other* instance and our
+///   accept thread waits for a client that never comes. The pipe name is fixed
+///   by design, so two instances is a situation that will happen. Waiting on a
+///   stop event alongside the connect removes the problem rather than making
+///   it less likely.
+/// - **A client must not be able to pin a thread.** The pipe is open to every
+///   integrity level by design, so anything on the machine can connect. A
+///   connection that says nothing gets [`CLIENT_TIMEOUT`] and is then dropped.
 mod pipe {
     use anyhow::{bail, Result};
-    use std::os::windows::io::{FromRawHandle, OwnedHandle};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::time::{Duration, Instant};
 
-    use windows_sys::Win32::Foundation::{ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{
+        ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    };
     use windows_sys::Win32::Security::{
         InitializeSecurityDescriptor, SetSecurityDescriptorDacl, PSECURITY_DESCRIPTOR,
         SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
     };
     // PIPE_ACCESS_* live under Storage::FileSystem because they share the
     // FILE_FLAGS_AND_ATTRIBUTES type with CreateFile.
-    use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FlushFileBuffers, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX,
+    };
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
         PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
+    use windows_sys::Win32::System::Threading::{
+        CreateEventW, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+    };
+    use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
     const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
+
+    /// `ERROR_IO_PENDING` - the ordinary outcome of starting overlapped I/O.
+    const ERROR_IO_PENDING: i32 = 997;
+
+    /// How long a connected client has to complete its whole exchange.
+    ///
+    /// The provider's own budget is two seconds, so anything approaching this
+    /// is not the provider. Generous enough to be invisible to a legitimate
+    /// caller on a loaded machine, short enough that a silent one is gone
+    /// quickly.
+    pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    /// A connected client.
-    pub struct Connection {
-        handle: OwnedHandle,
+    fn raw(h: &OwnedHandle) -> HANDLE {
+        h.as_raw_handle() as HANDLE
     }
 
-    impl Connection {
-        fn raw(&self) -> HANDLE {
-            use std::os::windows::io::AsRawHandle;
-            self.handle.as_raw_handle() as HANDLE
+    /// Create a manual-reset event, initially unsignalled.
+    fn event() -> Result<OwnedHandle> {
+        // SAFETY: an all-defaults, unnamed event.
+        let h = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if h.is_null() {
+            bail!("CreateEventW failed: {}", std::io::Error::last_os_error());
         }
+        // SAFETY: freshly created and not owned elsewhere.
+        Ok(unsafe { OwnedHandle::from_raw_handle(h as _) })
+    }
+
+    /// Tells the accept loop to stop, from any thread.
+    ///
+    /// An event rather than a flag: a flag can only be noticed by code that is
+    /// running, and the accept loop spends its life blocked.
+    pub struct StopSignal(OwnedHandle);
+
+    impl StopSignal {
+        pub fn new() -> Result<Self> {
+            Ok(Self(event()?))
+        }
+
+        pub fn signal(&self) {
+            // SAFETY: a live event handle.
+            unsafe { SetEvent(raw(&self.0)) };
+        }
+
+        pub fn is_set(&self) -> bool {
+            // SAFETY: a live event handle; zero timeout, so this only polls.
+            unsafe { WaitForSingleObject(raw(&self.0), 0) == WAIT_OBJECT_0 }
+        }
+
+        fn handle(&self) -> HANDLE {
+            raw(&self.0)
+        }
+    }
+
+    /// A connected client, with a deadline for the whole exchange.
+    pub struct Connection {
+        handle: OwnedHandle,
+        event: OwnedHandle,
+        deadline: Instant,
     }
 
     impl Drop for Connection {
         fn drop(&mut self) {
-            // SAFETY: the handle is still owned and valid until `handle` drops.
-            unsafe { DisconnectNamedPipe(self.raw()) };
+            // Flush *before* disconnecting. `DisconnectNamedPipe` discards
+            // anything the client has not read yet, so without this the
+            // response is thrown away whenever the server gets back here
+            // first - which is most of the time, and looks from the client
+            // side exactly like a service that never answered.
+            //
+            // `FlushFileBuffers` on a pipe server blocks until the client has
+            // drained the data, but it returns immediately if the client goes
+            // away, so it cannot hang on a caller that has given up.
+            // SAFETY: the handle is still owned and valid until it drops.
+            unsafe {
+                FlushFileBuffers(raw(&self.handle));
+                DisconnectNamedPipe(raw(&self.handle));
+            }
         }
     }
 
-    impl std::io::Read for Connection {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            use windows_sys::Win32::Storage::FileSystem::ReadFile;
-            let mut read = 0u32;
-            // SAFETY: `buf` is a valid writable slice of the given length.
-            let ok = unsafe {
-                ReadFile(
-                    self.raw(),
-                    buf.as_mut_ptr(),
-                    buf.len() as u32,
-                    &mut read,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok == 0 {
-                return Err(std::io::Error::last_os_error());
+    impl Connection {
+        fn remaining_ms(&self) -> u32 {
+            match self.deadline.checked_duration_since(Instant::now()) {
+                Some(d) if !d.is_zero() => d.as_millis().min(u32::MAX as u128) as u32,
+                _ => 0,
             }
-            Ok(read as usize)
-        }
-    }
-
-    impl std::io::Write for Connection {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            use windows_sys::Win32::Storage::FileSystem::WriteFile;
-            let mut written = 0u32;
-            // SAFETY: `buf` is a valid readable slice of the given length.
-            let ok = unsafe {
-                WriteFile(
-                    self.raw(),
-                    buf.as_ptr(),
-                    buf.len() as u32,
-                    &mut written,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok == 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(written as usize)
         }
 
-        fn flush(&mut self) -> std::io::Result<()> {
-            use windows_sys::Win32::Storage::FileSystem::FlushFileBuffers;
-            // SAFETY: the handle is valid for the lifetime of `self`.
-            unsafe { FlushFileBuffers(self.raw()) };
+        /// Complete one overlapped operation, or give up and cancel it.
+        fn finish(&self, ov: &mut OVERLAPPED, started_ok: bool) -> Option<u32> {
+            // Only wait when the operation actually went pending: an
+            // overlapped call that completes synchronously does not reliably
+            // signal the event, and waiting on it then burns the whole
+            // deadline before failing.
+            if !started_ok {
+                if std::io::Error::last_os_error().raw_os_error() != Some(ERROR_IO_PENDING) {
+                    return None;
+                }
+                // SAFETY: a live event handle.
+                if unsafe { WaitForSingleObject(raw(&self.event), self.remaining_ms()) }
+                    != WAIT_OBJECT_0
+                {
+                    // SAFETY: cancelling our own in-flight I/O on our own
+                    // handle, then waiting so the buffer is idle before return.
+                    unsafe {
+                        CancelIoEx(raw(&self.handle), ov);
+                        let mut done = 0u32;
+                        GetOverlappedResult(raw(&self.handle), ov, &mut done, 1);
+                    }
+                    return None;
+                }
+            }
+            let mut transferred = 0u32;
+            // SAFETY: the operation is complete, so this cannot block.
+            let ok = unsafe { GetOverlappedResult(raw(&self.handle), ov, &mut transferred, 1) };
+            (ok != 0).then_some(transferred)
+        }
+
+        pub fn read_exact(&self, buf: &mut [u8]) -> Result<()> {
+            let mut filled = 0usize;
+            while filled < buf.len() {
+                if self.remaining_ms() == 0 {
+                    bail!("client went quiet with {} bytes still to read", buf.len() - filled);
+                }
+                // SAFETY: a zeroed OVERLAPPED carrying our event.
+                let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
+                ov.hEvent = raw(&self.event);
+
+                let want = (buf.len() - filled) as u32;
+                // SAFETY: writing into the unfilled remainder of `buf`.
+                let started = unsafe {
+                    ReadFile(
+                        raw(&self.handle),
+                        buf[filled..].as_mut_ptr(),
+                        want,
+                        std::ptr::null_mut(),
+                        &mut ov,
+                    )
+                };
+                match self.finish(&mut ov, started != 0) {
+                    Some(n) if n > 0 => filled += n as usize,
+                    _ => bail!("reading from the client failed or timed out"),
+                }
+            }
+            Ok(())
+        }
+
+        pub fn write_all(&self, mut buf: &[u8]) -> Result<()> {
+            while !buf.is_empty() {
+                if self.remaining_ms() == 0 {
+                    bail!("timed out writing the response");
+                }
+                // SAFETY: a zeroed OVERLAPPED carrying our event.
+                let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
+                ov.hEvent = raw(&self.event);
+
+                // SAFETY: `buf` is readable for its length.
+                let started = unsafe {
+                    WriteFile(
+                        raw(&self.handle),
+                        buf.as_ptr(),
+                        buf.len() as u32,
+                        std::ptr::null_mut(),
+                        &mut ov,
+                    )
+                };
+                match self.finish(&mut ov, started != 0) {
+                    Some(n) if n > 0 => buf = &buf[n as usize..],
+                    _ => bail!("writing to the client failed or timed out"),
+                }
+            }
             Ok(())
         }
     }
 
-    /// Create a pipe instance and block until a client connects.
-    ///
-    /// Returns `Ok(None)` when `stop` was set while waiting.
-    /// Create one pipe instance and block until a client connects.
+    /// Create one pipe instance and wait for a client, or for `stop`.
     ///
     /// `on_created` fires once the instance exists but before waiting, so the
     /// caller can report readiness without waiting for actual traffic.
+    /// Returns `Ok(None)` when asked to stop.
     pub fn create_and_wait(
-        stop: &AtomicBool,
+        stop: &StopSignal,
         on_created: &mut dyn FnMut(),
     ) -> Result<Option<Connection>> {
         // A null DACL grants everyone access. That is deliberate and needed:
@@ -363,7 +518,8 @@ mod pipe {
         //
         // The exposure is bounded by the protocol, which only ever accepts
         // bytes to scan and only ever returns a verdict. There is no command
-        // surface here to abuse.
+        // surface here to abuse, and a connection that says nothing is dropped
+        // after CLIENT_TIMEOUT rather than holding a thread.
         let mut sd: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
         // SAFETY: `sd` is a correctly sized, zeroed SECURITY_DESCRIPTOR.
         unsafe {
@@ -389,7 +545,7 @@ mod pipe {
         let handle = unsafe {
             CreateNamedPipeW(
                 name.as_ptr(),
-                PIPE_ACCESS_DUPLEX,
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                 PIPE_UNLIMITED_INSTANCES,
                 64 * 1024,
@@ -401,7 +557,6 @@ mod pipe {
         if handle == INVALID_HANDLE_VALUE || handle.is_null() {
             bail!("CreateNamedPipeW failed: {}", std::io::Error::last_os_error());
         }
-
         // SAFETY: the handle came from CreateNamedPipeW and is not otherwise
         // owned.
         let owned = unsafe { OwnedHandle::from_raw_handle(handle as _) };
@@ -410,20 +565,52 @@ mod pipe {
         // it will queue rather than be told it is missing.
         on_created();
 
-        // SAFETY: `handle` is a valid pipe instance awaiting a client.
-        let connected = unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) };
-        let ok = connected != 0
-            || std::io::Error::last_os_error().raw_os_error() == Some(ERROR_PIPE_CONNECTED as i32);
+        let connect_event = event()?;
+        // SAFETY: a zeroed OVERLAPPED carrying our event.
+        let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
+        ov.hEvent = raw(&connect_event);
 
-        if stop.load(Ordering::Relaxed) {
+        // SAFETY: `handle` is a valid pipe instance awaiting a client.
+        let started = unsafe { ConnectNamedPipe(handle, &mut ov) };
+        let already = std::io::Error::last_os_error().raw_os_error()
+            == Some(ERROR_PIPE_CONNECTED as i32);
+
+        if started == 0 && !already {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(ERROR_IO_PENDING) {
+                bail!("ConnectNamedPipe failed: {err}");
+            }
+
+            // Wait for a client *or* for the stop signal. This is the whole
+            // reason the connect is overlapped.
+            let waits = [raw(&connect_event), stop.handle()];
+            // SAFETY: two live event handles; INFINITE is bounded in practice
+            // by one of them always being signalled.
+            let which = unsafe { WaitForMultipleObjects(2, waits.as_ptr(), 0, u32::MAX) };
+
+            if which != WAIT_OBJECT_0 {
+                // Stopping, or the wait failed. Either way, cancel the
+                // pending connect and let the instance go.
+                // SAFETY: cancelling our own in-flight connect.
+                unsafe {
+                    CancelIoEx(handle, &ov);
+                    let mut done = 0u32;
+                    GetOverlappedResult(handle, &ov, &mut done, 1);
+                }
+                return Ok(None);
+            }
+        }
+
+        if stop.is_set() {
             return Ok(None);
         }
-        if !ok {
-            bail!("ConnectNamedPipe failed: {}", std::io::Error::last_os_error());
-        }
-        Ok(Some(Connection { handle: owned }))
-    }
 
+        Ok(Some(Connection {
+            handle: owned,
+            event: event()?,
+            deadline: Instant::now() + CLIENT_TIMEOUT,
+        }))
+    }
 }
 
 /// Serialising tests that bind the scan pipe.
