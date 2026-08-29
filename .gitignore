@@ -4,3 +4,4 @@ dist/
 *.pdb
 /signatures/
 /testdata/samples/
+/shots/

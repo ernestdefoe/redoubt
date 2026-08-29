@@ -1,0 +1,16 @@
+{
+  "name": "redoubt-ui",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Redoubt desktop UI assets",
+  "scripts": {
+    "build": "tailwindcss -i src/app.css -o dist/app.css --minify",
+    "watch": "tailwindcss -i src/app.css -o dist/app.css --watch"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.1.0",
+    "daisyui": "^5.0.0",
+    "puppeteer-core": "^25.9.0",
+    "tailwindcss": "^4.1.0"
+  }
+}

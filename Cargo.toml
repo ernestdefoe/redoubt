@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/redoubt-core",
     "crates/redoubt-cli",
+    "crates/redoubt-ui",
     "crates/redoubt-service",
 ]
 

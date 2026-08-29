@@ -197,12 +197,18 @@ pub fn default_direct_sources() -> Vec<DirectSource> {
         url: format!("{SANE}/{file}"),
     };
 
+    // Verified against what the mirror actually serves. Several databases
+    // Sanesecurity still lists are retired stubs: `crdfam.clamav.hdb` contains
+    // one signature named "CRDF.No.Longer.Distributed.Via.Sanesecurity", and
+    // the `malware.expert.*` set contains a single advert. The `.ndb` one is
+    // actively harmful - a body pattern matching the text "buy subscription
+    // from malware expert", which would fire on any file quoting it. Fetching
+    // dead sources is wasted bandwidth; indexing that one is a false positive
+    // waiting to happen.
     let mut v: Vec<DirectSource> = [
         // Malware hashes.
         "malwarehash.hsb",
         "rogue.hdb",
-        "crdfam.clamav.hdb",
-        "malware.expert.hdb",
         "hackingteam.hsb",
         "porcupine.hsb",
         "winnow.attachments.hdb",
@@ -210,12 +216,9 @@ pub fn default_direct_sources() -> Vec<DirectSource> {
         "bofhland_malware_attach.hdb",
         // Malware body patterns.
         "badmacro.ndb",
-        "malware.expert.ndb",
         "porcupine.ndb",
         "foxhole_all.ndb",
         "foxhole_js.ndb",
-        // Known-good, to suppress false positives.
-        "malware.expert.fp",
     ]
     .iter()
     .map(|f| sane(f))
@@ -226,6 +229,77 @@ pub fn default_direct_sources() -> Vec<DirectSource> {
         url: "https://urlhaus.abuse.ch/downloads/urlhaus.ndb".to_string(),
     });
     v
+}
+
+/// Sources withdrawn because they are dead or actively harmful.
+///
+/// A user's `config.toml` is written once and then belongs to them, so a
+/// change to [`default_direct_sources`] does not reach an existing install.
+/// For an ordinary preference that is correct. For a source known to produce
+/// false positives it is not: `malware.expert.ndb` is a body pattern over the
+/// text "buy subscription from malware expert", so any file quoting that
+/// phrase gets reported as malware, and a stale config would keep it loaded
+/// indefinitely.
+///
+/// Entries here are refused even when the config still lists them. Keep this
+/// list short and only for sources that are broken, not merely unfashionable.
+pub const RETIRED_SOURCES: &[(&str, &str)] = &[
+    ("crdfam.clamav.hdb", "withdrawn by the publisher; contains only a retirement notice"),
+    ("malware.expert.hdb", "contains only a subscription advert"),
+    ("malware.expert.fp", "contains only a subscription advert"),
+    (
+        "malware.expert.ndb",
+        "a body pattern over marketing text - matches any file quoting it",
+    ),
+];
+
+/// Why a source is retired, if it is.
+pub fn retired_reason(name: &str) -> Option<&'static str> {
+    RETIRED_SOURCES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, why)| *why)
+}
+
+/// Remove direct-source files that are no longer configured.
+///
+/// Dropping a source from the config does not remove what it already wrote, so
+/// without this a retired database keeps being compiled into the index for
+/// ever. That matters: the source this was written for shipped a body pattern
+/// matching marketing text, which would go on producing false positives long
+/// after the source was removed.
+///
+/// Only files Redoubt fetched itself are considered, identified by the `.meta`
+/// sidecar written beside them. freshclam's containers and anything the user
+/// dropped in by hand are never touched.
+pub fn prune_orphaned_sources(dir: &Path, configured: &[DirectSource]) -> Vec<String> {
+    let keep: std::collections::HashSet<&str> = configured
+        .iter()
+        .map(|s| s.name.as_str())
+        .filter(|n| retired_reason(n).is_none())
+        .collect();
+    let mut removed = Vec::new();
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return removed;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // Sidecars are named `.<file>.meta`; find the file each describes.
+        let Some(owned) = name.strip_prefix('.').and_then(|n| n.strip_suffix(".meta")) else {
+            continue;
+        };
+        if keep.contains(owned) {
+            continue;
+        }
+        let data = dir.join(owned);
+        if data.exists() && std::fs::remove_file(&data).is_ok() {
+            removed.push(owned.to_string());
+        }
+        let _ = std::fs::remove_file(entry.path());
+    }
+    removed.sort();
+    removed
 }
 
 /// Cached validators for a direct source, so repeat polls cost a 304.
@@ -397,9 +471,19 @@ pub fn update(
         }
     };
 
+    // --- Retire anything no longer configured -----------------------------
+    let pruned = prune_orphaned_sources(dir, &cfg.updates.direct_sources);
+    for name in &pruned {
+        progress(&format!("  {name:<28} removed (no longer a configured source)"));
+    }
+
     // --- Third-party direct sources --------------------------------------
     let mut direct = Vec::new();
     for source in &cfg.updates.direct_sources {
+        if let Some(why) = retired_reason(&source.name) {
+            progress(&format!("  {:<28} skipped - {why}", source.name));
+            continue;
+        }
         let outcome = match fetch_direct(source, dir) {
             Ok(o) => o,
             Err(e) => FetchOutcome::Failed { reason: format!("{e:#}") },
@@ -420,7 +504,7 @@ pub fn update(
 
     // --- Compile ----------------------------------------------------------
     let mut report = UpdateReport { freshclam, direct, recompiled: None };
-    if report.anything_changed() || force || !index_path.exists() {
+    if !pruned.is_empty() || report.anything_changed() || force || !index_path.exists() {
         progress("compiling index...");
         report.recompiled = Some(compile_dir(dir, index_path)?);
     }
@@ -460,6 +544,25 @@ mod tests {
     }
 
     #[test]
+    fn retired_stub_databases_are_not_fetched() {
+        // These are still listed on the mirror but contain only a retirement
+        // notice or a subscription advert. `malware.expert.ndb` is the one
+        // that matters: it is a body pattern over marketing text, so indexing
+        // it means any file quoting that phrase is reported as malware.
+        let names: Vec<String> = default_direct_sources().into_iter().map(|s| s.name).collect();
+        for dead in [
+            "crdfam.clamav.hdb",
+            "malware.expert.hdb",
+            "malware.expert.ndb",
+            "malware.expert.fp",
+        ] {
+            assert!(!names.contains(&dead.to_string()), "{dead} is a retired stub");
+        }
+        assert!(names.contains(&"malwarehash.hsb".to_string()), "real sources must remain");
+        assert!(names.contains(&"urlhaus.ndb".to_string()));
+    }
+
+    #[test]
     fn default_sources_have_unique_names() {
         let sources = default_direct_sources();
         let mut names: Vec<&str> = sources.iter().map(|s| s.name.as_str()).collect();
@@ -495,6 +598,89 @@ mod tests {
         // A configured path that does not exist must not silently fall back to
         // a system install the user did not ask for.
         assert_eq!(find_freshclam(Some(Path::new(r"C:\nope\freshclam.exe"))), None);
+    }
+
+    #[test]
+    fn retired_sources_are_dropped_even_when_still_configured() {
+        // The scenario this exists for: an install whose config.toml predates
+        // the source being withdrawn.
+        let dir = std::env::temp_dir().join(format!("redoubt-retired-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for name in ["malware.expert.ndb", "badmacro.ndb"] {
+            std::fs::write(dir.join(name), b"sig").unwrap();
+            std::fs::write(dir.join(format!(".{name}.meta")), b"{}").unwrap();
+        }
+
+        // A stale config that still lists the retired source.
+        let configured = vec![
+            DirectSource {
+                name: "malware.expert.ndb".into(),
+                url: "https://example.invalid/x".into(),
+            },
+            DirectSource {
+                name: "badmacro.ndb".into(),
+                url: "https://example.invalid/y".into(),
+            },
+        ];
+
+        let removed = prune_orphaned_sources(&dir, &configured);
+        assert_eq!(removed, vec!["malware.expert.ndb"]);
+        assert!(!dir.join("malware.expert.ndb").exists());
+        assert!(dir.join("badmacro.ndb").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn every_retired_source_explains_itself() {
+        for (name, why) in RETIRED_SOURCES {
+            assert!(!why.is_empty(), "{name} has no stated reason");
+            assert_eq!(retired_reason(name), Some(*why));
+        }
+        assert_eq!(retired_reason("badmacro.ndb"), None);
+    }
+
+    #[test]
+    fn defaults_never_include_a_retired_source() {
+        for s in default_direct_sources() {
+            assert!(
+                retired_reason(&s.name).is_none(),
+                "{} is both a default and retired",
+                s.name
+            );
+        }
+    }
+
+    #[test]
+    fn orphaned_direct_sources_are_removed() {
+        let dir = std::env::temp_dir().join(format!("redoubt-prune-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Two files we fetched, each with its sidecar.
+        for name in ["keep.ndb", "retired.ndb"] {
+            std::fs::write(dir.join(name), b"sig").unwrap();
+            std::fs::write(dir.join(format!(".{name}.meta")), b"{}").unwrap();
+        }
+        // A container from freshclam, and a hand-dropped file: neither has a
+        // sidecar, so neither may be touched.
+        std::fs::write(dir.join("daily.cvd"), b"container").unwrap();
+        std::fs::write(dir.join("mine.hdb"), b"hand-added").unwrap();
+
+        let configured = vec![DirectSource {
+            name: "keep.ndb".into(),
+            url: "https://example.invalid/keep.ndb".into(),
+        }];
+        let removed = prune_orphaned_sources(&dir, &configured);
+
+        assert_eq!(removed, vec!["retired.ndb"]);
+        assert!(!dir.join("retired.ndb").exists());
+        assert!(!dir.join(".retired.ndb.meta").exists(), "the sidecar should go too");
+        assert!(dir.join("keep.ndb").exists());
+        assert!(dir.join("daily.cvd").exists(), "freshclam containers are not ours to delete");
+        assert!(dir.join("mine.hdb").exists(), "hand-added files are not ours to delete");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

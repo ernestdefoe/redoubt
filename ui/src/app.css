@@ -1,0 +1,89 @@
+@import "tailwindcss";
+@source "./index.html";
+@source "./app.js";
+
+@plugin "daisyui" {
+  themes: false;
+  logs: false;
+}
+
+@plugin "daisyui/theme" {
+  name: "redoubt";
+  default: true;
+  prefersdark: true;
+  color-scheme: dark;
+
+  --color-base-100: oklch(21% 0.014 260);
+  --color-base-200: oklch(25% 0.016 260);
+  --color-base-300: oklch(30% 0.018 260);
+  --color-base-content: oklch(93% 0.008 260);
+  --color-primary: oklch(70% 0.145 235);
+  --color-primary-content: oklch(18% 0.03 235);
+  --color-secondary: oklch(64% 0.13 285);
+  --color-secondary-content: oklch(97% 0.01 285);
+  --color-accent: oklch(74% 0.14 175);
+  --color-accent-content: oklch(18% 0.03 175);
+  --color-neutral: oklch(33% 0.02 260);
+  --color-neutral-content: oklch(93% 0.008 260);
+  --color-info: oklch(72% 0.12 235);
+  --color-info-content: oklch(18% 0.03 235);
+  --color-success: oklch(72% 0.16 152);
+  --color-success-content: oklch(18% 0.03 152);
+  --color-warning: oklch(81% 0.15 78);
+  --color-warning-content: oklch(22% 0.04 78);
+  --color-error: oklch(66% 0.2 22);
+  --color-error-content: oklch(98% 0.01 22);
+
+  --radius-selector: 1rem;
+  --radius-field: 0.5rem;
+  --radius-box: 0.75rem;
+  --size-selector: 0.25rem;
+  --size-field: 0.25rem;
+  --border: 1px;
+  --depth: 1;
+  --noise: 0;
+}
+
+@plugin "daisyui/theme" {
+  name: "redoubt-light";
+  default: false;
+  prefersdark: false;
+  color-scheme: light;
+
+  --color-base-100: oklch(99% 0.002 260);
+  --color-base-200: oklch(96.5% 0.004 260);
+  --color-base-300: oklch(92.5% 0.006 260);
+  --color-base-content: oklch(27% 0.02 260);
+  --color-primary: oklch(53% 0.16 235);
+  --color-primary-content: oklch(99% 0.01 235);
+  --color-secondary: oklch(50% 0.15 285);
+  --color-secondary-content: oklch(99% 0.01 285);
+  --color-accent: oklch(56% 0.13 175);
+  --color-accent-content: oklch(99% 0.01 175);
+  --color-neutral: oklch(38% 0.02 260);
+  --color-neutral-content: oklch(98% 0.005 260);
+  --color-info: oklch(55% 0.13 235);
+  --color-info-content: oklch(99% 0.01 235);
+  --color-success: oklch(56% 0.15 152);
+  --color-success-content: oklch(99% 0.01 152);
+  --color-warning: oklch(68% 0.15 65);
+  --color-warning-content: oklch(99% 0.01 65);
+  --color-error: oklch(55% 0.21 25);
+  --color-error-content: oklch(99% 0.01 25);
+
+  --radius-selector: 1rem;
+  --radius-field: 0.5rem;
+  --radius-box: 0.75rem;
+  --size-selector: 0.25rem;
+  --size-field: 0.25rem;
+  --border: 1px;
+  --depth: 1;
+  --noise: 0;
+}
+
+/* Tabular figures everywhere numbers are compared down a column. Without
+   this, counts jitter as they update and columns fail to line up. */
+@utility tnum {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}

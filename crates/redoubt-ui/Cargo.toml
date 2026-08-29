@@ -1,0 +1,20 @@
+[package]
+name = "redoubt-ui"
+description = "Redoubt desktop interface: local HTTP server and JSON API over the engine."
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+
+[dependencies]
+redoubt-core = { path = "../redoubt-core" }
+anyhow.workspace      = true
+serde.workspace       = true
+serde_json.workspace  = true
+tracing.workspace     = true
+parking_lot.workspace = true
+rayon.workspace       = true
+walkdir.workspace     = true
+time.workspace        = true
+tiny_http = "0.12"

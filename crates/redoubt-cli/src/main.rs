@@ -65,6 +65,17 @@ enum Command {
         show_skipped: bool,
     },
 
+    /// Open the Redoubt interface.
+    Ui {
+        /// Port to bind on loopback. 0 picks a free one.
+        #[arg(long, default_value_t = 7311)]
+        port: u16,
+
+        /// Do not open a browser window automatically.
+        #[arg(long)]
+        no_open: bool,
+    },
+
     /// Show resolved configuration and where everything lives.
     Config,
 }
@@ -109,6 +120,25 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Db(cmd) => run_db(&cfg, cmd),
         Command::Rules(cmd) => run_rules(&cfg, cmd),
+        Command::Ui { port, no_open } => {
+            let path = cli
+                .config
+                .clone()
+                .unwrap_or_else(redoubt_core::config::default_config_path);
+            redoubt_ui::serve(cfg.clone(), path, port, |bound| {
+                let url = format!("http://127.0.0.1:{bound}/");
+                println!("Redoubt interface running at {url}");
+                println!("Press Ctrl-C to stop.");
+                if !no_open {
+                    // `start` is a cmd builtin, so it needs a shell. The empty
+                    // first argument is the window title cmd otherwise steals
+                    // from a quoted URL.
+                    let _ = std::process::Command::new("cmd")
+                        .args(["/C", "start", "", &url])
+                        .spawn();
+                }
+            })
+        }
         Command::Scan { paths, threads, show_clean, json, follow_symlinks, show_skipped } => {
             let threads = if threads > 0 { threads } else { cfg.worker_count() };
             scan::run(

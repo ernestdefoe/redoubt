@@ -11,6 +11,7 @@
 //! [`IndexBuilder`]. This runs in the updater, never on the scan path.
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use crate::sigindex::{Group, IndexBuilder, IndexStats};
@@ -100,7 +101,7 @@ impl CompileReport {
         let mut out: Vec<SkippedFormat> = by_ext
             .into_iter()
             .map(|(extension, (files, bytes))| SkippedFormat {
-                note: format_note(&extension),
+                note: format_note(&extension).to_string(),
                 extension,
                 files,
                 bytes,
@@ -128,17 +129,21 @@ impl CompileReport {
 }
 
 /// One unhandled signature format, rolled up across every file using it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkippedFormat {
     pub extension: String,
     pub files: usize,
     pub bytes: usize,
     /// What the format is and whether supporting it is on the table.
-    pub note: &'static str,
+    pub note: String,
 }
 
 /// Plain-English explanation for each format we do not consume, so the gap
 /// report says *what is missing* rather than just naming an extension.
+pub fn describe_format(extension: &str) -> &'static str {
+    format_note(extension)
+}
+
 fn format_note(extension: &str) -> &'static str {
     match extension {
         "ldb" | "ldu" => "logical signatures - multi-pattern boolean rules; the largest gap",
@@ -151,6 +156,62 @@ fn format_note(extension: &str) -> &'static str {
         "ign" | "ign2" => "signature suppression lists",
         "yara" | "yar" => "YARA rules - handled by the YARA engine, not this index",
         _ => "unrecognised signature format",
+    }
+}
+
+/// A durable summary of the last compile, written beside the index.
+///
+/// The unindexed-format breakdown cannot be recovered by looking at the
+/// signature directory: those formats live *inside* the `.cvd` containers, not
+/// as loose files. Without persisting it, anything that starts later - the UI,
+/// a status command - has no way to report coverage honestly short of
+/// decompressing 200 MB of containers again.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CompileSummary {
+    pub db_version: u32,
+    pub built_epoch: u64,
+    pub file_hashes: u64,
+    pub section_hashes: u64,
+    pub body_patterns: u64,
+    pub allowlisted: u64,
+    pub unsupported: u64,
+    pub malformed: u64,
+    pub degenerate_rejected: u64,
+    pub coverage: f64,
+    pub sources: Vec<String>,
+    pub skipped: Vec<SkippedFormat>,
+}
+
+impl CompileSummary {
+    /// Path of the sidecar for a given index path.
+    pub fn path_for(index_path: &Path) -> std::path::PathBuf {
+        index_path.with_extension("report.json")
+    }
+
+    /// Read the sidecar beside `index_path`, if one exists and parses.
+    pub fn load_beside(index_path: &Path) -> Option<Self> {
+        let text = std::fs::read_to_string(Self::path_for(index_path)).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+}
+
+impl CompileReport {
+    /// Condense into the durable summary.
+    pub fn to_summary(&self, built_epoch: u64) -> CompileSummary {
+        CompileSummary {
+            db_version: self.index.db_version,
+            built_epoch,
+            file_hashes: self.index.file_hashes,
+            section_hashes: self.index.section_hashes,
+            body_patterns: self.index.body_patterns,
+            allowlisted: self.index.allowlisted,
+            unsupported: self.unsupported(),
+            malformed: self.malformed(),
+            degenerate_rejected: self.degenerate_rejected,
+            coverage: self.coverage(),
+            sources: self.sources.iter().map(|(n, _)| n.clone()).collect(),
+            skipped: self.skipped_by_format(),
+        }
     }
 }
 
@@ -259,12 +320,20 @@ impl Compiler {
         Ok(())
     }
 
-    /// Sort, deduplicate and write the index.
+    /// Sort, deduplicate and write the index, plus its report sidecar.
     pub fn finish(mut self, out: &Path) -> Result<CompileReport> {
         let builder = self.builder.retag(self.db_version, self.built_epoch);
         self.report.index = builder
             .write(out)
             .with_context(|| format!("writing index {}", out.display()))?;
+
+        // Best-effort: a missing sidecar degrades the coverage display but
+        // must never fail an otherwise good compile.
+        let summary = self.report.to_summary(self.built_epoch);
+        if let Ok(json) = serde_json::to_string_pretty(&summary) {
+            let _ = std::fs::write(CompileSummary::path_for(out), json);
+        }
+
         Ok(self.report)
     }
 }
