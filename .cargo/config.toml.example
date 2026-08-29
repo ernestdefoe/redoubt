@@ -1,0 +1,12 @@
+# Optional. Copy to `.cargo/config.toml` if your checkout lives inside a synced
+# folder - OneDrive, Dropbox, iCloud.
+#
+# A Rust `target/` directory is tens of thousands of small files that change on
+# every build. A sync client will try to upload all of them, and on a large
+# workspace like this one that is enough to make a machine unusable. Pointing
+# the build output somewhere unsynced fixes it.
+#
+# Change the path to one that exists on your machine.
+
+[build]
+target-dir = "C:/Users/YOU/.cargo-target/redoubt"

@@ -11,3 +11,7 @@ dist/
 installer/stage/
 installer/out/
 brand/_*-preview.png
+
+# Local build-output redirection. Machine-specific by nature, so it is not
+# shared; see .cargo/config.toml.example.
+/.cargo/config.toml

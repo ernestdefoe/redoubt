@@ -9,6 +9,29 @@ and watches the places files actually arrive.
 It runs **observe-first**: it detects, logs and reports, and does not quarantine
 anything until you explicitly turn enforcement on.
 
+Free and MIT-licensed. [Download the installer](installer/) or build it
+yourself.
+
+## What this is, and what it is not
+
+Worth knowing before you install it, so nothing here is a surprise:
+
+- **It runs alongside Microsoft Defender, not instead of it.** Redoubt is not
+  registered with the Windows Security Center — that needs membership of the
+  Microsoft Virus Initiative and certification by an independent lab. Defender
+  keeps running and keeps protecting you. Redoubt adds to it.
+- **It is not code-signed.** SmartScreen will warn you when you run the
+  installer. That is a certificate I have not bought, not a comment on the code.
+- **It cannot stop a malicious executable at the moment you launch it.** That
+  needs a filesystem minifilter, which is a kernel driver, which Microsoft has
+  to sign. Redoubt catches such a file when it is *written* — which for
+  something downloaded or dropped is usually first — but not at launch.
+- **It can stop a malicious script before it runs.** That path does not need a
+  driver, and it is built and working.
+- **It tells you what it does not cover.** The interface reports how much of
+  each signature format is actually evaluated, rather than implying all of it.
+  Where this document says something is not built, it is not built.
+
 ---
 
 ## Status
@@ -163,6 +186,22 @@ quarantine entry, never neither. Restore is byte-exact and refuses to overwrite
 a file that reappeared in the meantime.
 
 ## Where signatures come from
+
+**Redoubt ships no signatures.** The installer is binaries only; every database
+is fetched onto your machine from its publisher, under that publisher's terms:
+
+| Source | What | Terms |
+|---|---|---|
+| ClamAV main/daily/bytecode | Hashes, patterns, logical signatures | GPL-2.0, via Cisco Talos |
+| Sanesecurity | Additional ClamAV-format databases | [sanesecurity.com](https://sanesecurity.com/usage/) |
+| abuse.ch URLhaus | Malicious URL patterns | [abuse.ch](https://urlhaus.abuse.ch/) |
+| abuse.ch ThreatFox | Botnet C2 addresses | [threatfox.abuse.ch/faq/#tos](https://threatfox.abuse.ch/faq/#tos) |
+| Elastic protections-artifacts | YARA rules | Elastic License 2.0 |
+
+Redoubt's own code is MIT. The data is not Redoubt's to relicense, and anyone
+redistributing this — especially commercially — should read those terms rather
+than assume this table settled it.
+
 
 **ClamAV main/daily — via real `freshclam`.** ClamAV's CDN answers only to their
 own client (everything else gets a 403). Rather than impersonate it, Redoubt
