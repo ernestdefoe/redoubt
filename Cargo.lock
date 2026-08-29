@@ -1971,6 +1971,7 @@ dependencies = [
  "goblin",
  "hex",
  "md-5",
+ "memchr",
  "memmap2",
  "parking_lot",
  "rayon",

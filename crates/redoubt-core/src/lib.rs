@@ -19,6 +19,7 @@ pub mod config;
 pub mod cvd;
 pub mod hashing;
 pub mod heuristics;
+pub mod ldb;
 pub mod pe;
 pub mod quarantine;
 pub mod rules;

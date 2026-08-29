@@ -31,3 +31,4 @@ aho-corasick = "1.1.5"
 ureq = { version = "3.4.0", default-features = false, features = ["rustls"] }
 goblin = { version = "0.10.7", default-features = false, features = ["pe32", "pe64", "std", "endian_fd"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate", "bzip2"] }
+memchr = "2.8.3"

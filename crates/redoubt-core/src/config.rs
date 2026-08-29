@@ -200,6 +200,25 @@ pub struct ScanLimits {
     pub archive_depth: u8,
     /// Refuse to expand an archive entry that inflates beyond this (zip bomb).
     pub max_archive_entry_bytes: u64,
+
+    /// Shortest literal accepted from a multi-part logical signature.
+    ///
+    /// This is the main lever on resident memory, and the numbers are
+    /// measured rather than guessed. Against the real ClamAV database:
+    ///
+    /// | floor | logical rules | resident |
+    /// |-------|---------------|----------|
+    /// | 4     | 158,770       | ~520 MB  |
+    /// | 8     | 48,931        | ~300 MB  |
+    ///
+    /// The cost is the pattern-matching automaton, which grows quickly with
+    /// short patterns because they make its state graph dense. Eight is the
+    /// default because short literals are the weakest signals in the set, so
+    /// the first ones dropped are the ones contributing least - this is a
+    /// quality threshold that happens to bound memory, not an arbitrary cap.
+    ///
+    /// Lower it to 4 for maximum coverage if the memory is available.
+    pub min_logical_pattern_bytes: usize,
 }
 
 impl Default for ScanLimits {
@@ -209,6 +228,7 @@ impl Default for ScanLimits {
             timeout_ms: 5_000,
             archive_depth: 2,
             max_archive_entry_bytes: 512 * 1024 * 1024,
+            min_logical_pattern_bytes: 8,
         }
     }
 }

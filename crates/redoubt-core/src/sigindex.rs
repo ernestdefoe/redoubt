@@ -118,6 +118,8 @@ pub struct IndexBuilder {
     /// One `(hash_bytes, size, name_id)` list per table.
     tables: Vec<Vec<(Vec<u8>, u64, u32)>>,
     body: Vec<(u32, u8, Offset, Vec<u8>)>,
+    /// `(name_id, target, expression source, subsignature patterns)`
+    logical: Vec<(u32, u8, String, Vec<Vec<u8>>)>,
     names: Vec<String>,
     name_ids: HashMap<String, u32>,
     db_version: u32,
@@ -129,6 +131,7 @@ impl IndexBuilder {
         Self {
             tables: (0..TABLE_COUNT).map(|_| Vec::new()).collect(),
             body: Vec::new(),
+            logical: Vec::new(),
             names: Vec::new(),
             name_ids: HashMap::new(),
             db_version,
@@ -163,6 +166,13 @@ impl IndexBuilder {
         self.body.push((name_id, sig.target, sig.offset, sig.pattern));
     }
 
+    /// Add a logical signature.
+    pub fn add_logical(&mut self, sig: crate::ldb::LogicalSig) {
+        let name_id = self.intern(&sig.name);
+        self.logical
+            .push((name_id, sig.target, sig.expr.to_source(), sig.subsigs));
+    }
+
     /// Stamp the index with a database version and build time.
     ///
     /// Compiling several containers at once means the version is only known
@@ -176,7 +186,9 @@ impl IndexBuilder {
 
     /// Total accepted signatures across every table.
     pub fn len(&self) -> u64 {
-        self.tables.iter().map(|t| t.len() as u64).sum::<u64>() + self.body.len() as u64
+        self.tables.iter().map(|t| t.len() as u64).sum::<u64>()
+            + self.body.len() as u64
+            + self.logical.len() as u64
     }
 
     pub fn is_empty(&self) -> bool {
@@ -259,6 +271,40 @@ impl IndexBuilder {
         let body_len = cursor - body_offset;
         stats.body_patterns = body_count;
 
+        // Logical signatures.
+        //
+        // Layout per rule:
+        //   name_off:u32 | target:u8 | n_subsigs:u8 | expr_len:u16 | expr bytes
+        //   then n_subsigs x ( len:u16 | pattern bytes )
+        //
+        // The expression is stored as source rather than a compiled tree: it
+        // is only parsed when at least one of the rule's subsignatures has
+        // actually matched, which is rare, and storing text keeps ~138,000
+        // rules to a few megabytes.
+        let logical_offset = cursor;
+        let mut logical_count = 0u64;
+        for (name_id, target, expr, subsigs) in &self.logical {
+            if subsigs.len() > u8::MAX as usize || expr.len() > u16::MAX as usize {
+                continue;
+            }
+            if subsigs.iter().any(|s| s.len() > u16::MAX as usize) {
+                continue;
+            }
+            out.write_all(&name_offsets[*name_id as usize].to_le_bytes())?;
+            out.write_all(&[*target, subsigs.len() as u8])?;
+            out.write_all(&(expr.len() as u16).to_le_bytes())?;
+            out.write_all(expr.as_bytes())?;
+            cursor += 8 + expr.len() as u64;
+            for sub in subsigs {
+                out.write_all(&(sub.len() as u16).to_le_bytes())?;
+                out.write_all(sub)?;
+                cursor += 2 + sub.len() as u64;
+            }
+            logical_count += 1;
+        }
+        let logical_len = cursor - logical_offset;
+        stats.logical_rules = logical_count;
+
         let names_offset = cursor;
         out.write_all(&names_blob)?;
         let names_len = names_blob.len() as u64;
@@ -282,6 +328,9 @@ impl IndexBuilder {
         header[200..208].copy_from_slice(&body_offset.to_le_bytes());
         header[208..216].copy_from_slice(&body_len.to_le_bytes());
         header[216..224].copy_from_slice(&body_count.to_le_bytes());
+        header[224..232].copy_from_slice(&logical_offset.to_le_bytes());
+        header[232..240].copy_from_slice(&logical_len.to_le_bytes());
+        header[240..248].copy_from_slice(&logical_count.to_le_bytes());
 
         let mut file = out.into_inner().context("flushing index writer")?;
         use std::io::{Seek, SeekFrom};
@@ -303,13 +352,19 @@ pub struct IndexStats {
     pub file_hashes: u64,
     pub section_hashes: u64,
     pub body_patterns: u64,
+    /// Logical signatures: several patterns plus a boolean expression.
+    pub logical_rules: u64,
     pub allowlisted: u64,
     pub unique_names: u64,
 }
 
 impl IndexStats {
     pub fn total(&self) -> u64 {
-        self.file_hashes + self.section_hashes + self.body_patterns + self.allowlisted
+        self.file_hashes
+            + self.section_hashes
+            + self.body_patterns
+            + self.logical_rules
+            + self.allowlisted
     }
 }
 
@@ -330,6 +385,9 @@ pub struct SigIndex {
     body_offset: u64,
     body_len: u64,
     body_count: u64,
+    logical_offset: u64,
+    logical_len: u64,
+    logical_count: u64,
     db_version: u32,
     built_epoch: u64,
 }
@@ -390,6 +448,9 @@ impl SigIndex {
         let body_offset = u64::from_le_bytes(map[200..208].try_into().unwrap());
         let body_len = u64::from_le_bytes(map[208..216].try_into().unwrap());
         let body_count = u64::from_le_bytes(map[216..224].try_into().unwrap());
+        let logical_offset = u64::from_le_bytes(map[224..232].try_into().unwrap());
+        let logical_len = u64::from_le_bytes(map[232..240].try_into().unwrap());
+        let logical_count = u64::from_le_bytes(map[240..248].try_into().unwrap());
 
         let index = Self {
             map,
@@ -400,6 +461,9 @@ impl SigIndex {
             body_offset,
             body_len,
             body_count,
+            logical_offset,
+            logical_len,
+            logical_count,
             db_version,
             built_epoch,
         };
@@ -422,6 +486,7 @@ impl SigIndex {
         for (name, off, extent) in [
             ("names", self.names_offset, self.names_len),
             ("body", self.body_offset, self.body_len),
+            ("logical", self.logical_offset, self.logical_len),
         ] {
             let end = off.checked_add(extent).context("index section overflows")?;
             if end > len {
@@ -445,6 +510,7 @@ impl SigIndex {
             file_hashes: self.table_counts[0] + self.table_counts[1] + self.table_counts[2],
             section_hashes: self.table_counts[3] + self.table_counts[4] + self.table_counts[5],
             body_patterns: self.body_count,
+            logical_rules: self.logical_count,
             allowlisted: self.table_counts[6] + self.table_counts[7] + self.table_counts[8],
             unique_names: 0, // not stored; the builder reports it at compile time
         }
@@ -523,6 +589,16 @@ impl SigIndex {
         self.lookup(hash, Group::Allow, size)
     }
 
+    /// Iterate every logical signature.
+    pub fn logical_rules(&self) -> LogicalIter<'_> {
+        LogicalIter {
+            index: self,
+            cursor: self.logical_offset as usize,
+            end: (self.logical_offset + self.logical_len) as usize,
+            remaining: self.logical_count,
+        }
+    }
+
     /// Iterate every literal body pattern. The scanner uses this once at
     /// startup to build its multi-pattern automaton.
     pub fn body_patterns(&self) -> BodyPatternIter<'_> {
@@ -532,6 +608,65 @@ impl SigIndex {
             end: (self.body_offset + self.body_len) as usize,
             remaining: self.body_count,
         }
+    }
+}
+
+/// One logical signature read back out of the index.
+pub struct LogicalRef<'a> {
+    pub name: &'a str,
+    pub target: u8,
+    /// Expression source, parsed only when the rule has candidate matches.
+    pub expr: &'a str,
+    pub subsigs: Vec<&'a [u8]>,
+}
+
+pub struct LogicalIter<'a> {
+    index: &'a SigIndex,
+    cursor: usize,
+    end: usize,
+    remaining: u64,
+}
+
+impl<'a> Iterator for LogicalIter<'a> {
+    type Item = LogicalRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 || self.cursor + 8 > self.end {
+            return None;
+        }
+        let map = &self.index.map;
+        let name_off = u32::from_le_bytes(map[self.cursor..self.cursor + 4].try_into().unwrap());
+        let target = map[self.cursor + 4];
+        let n_subs = map[self.cursor + 5] as usize;
+        let expr_len =
+            u16::from_le_bytes(map[self.cursor + 6..self.cursor + 8].try_into().unwrap()) as usize;
+
+        let expr_start = self.cursor + 8;
+        if expr_start + expr_len > self.end {
+            self.remaining = 0;
+            return None;
+        }
+        let expr = std::str::from_utf8(&map[expr_start..expr_start + expr_len]).unwrap_or("");
+
+        let mut at = expr_start + expr_len;
+        let mut subsigs = Vec::with_capacity(n_subs);
+        for _ in 0..n_subs {
+            if at + 2 > self.end {
+                self.remaining = 0;
+                return None;
+            }
+            let len = u16::from_le_bytes(map[at..at + 2].try_into().unwrap()) as usize;
+            if at + 2 + len > self.end {
+                self.remaining = 0;
+                return None;
+            }
+            subsigs.push(&map[at + 2..at + 2 + len]);
+            at += 2 + len;
+        }
+
+        self.cursor = at;
+        self.remaining -= 1;
+        Some(LogicalRef { name: self.index.name_at(name_off), target, expr, subsigs })
     }
 }
 

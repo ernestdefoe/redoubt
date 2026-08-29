@@ -319,6 +319,8 @@ pub enum SigFileKind {
     Allowlist,
     /// Literal body pattern.
     Body,
+    /// Logical signature: several patterns plus a boolean expression.
+    Logical,
 }
 
 /// Map a signature file extension to its kind, or `None` if we do not handle it.
@@ -331,6 +333,7 @@ pub fn classify(extension: &str) -> Option<SigFileKind> {
         "mdb" | "mdu" | "msb" | "msu" => Some(SigFileKind::SectionHash),
         "fp" | "sfp" => Some(SigFileKind::Allowlist),
         "ndb" | "ndu" => Some(SigFileKind::Body),
+        "ldb" | "ldu" => Some(SigFileKind::Logical),
         _ => None,
     }
 }
@@ -466,8 +469,9 @@ mod tests {
         assert_eq!(classify("fp"), Some(SigFileKind::Allowlist));
         assert_eq!(classify("sfp"), Some(SigFileKind::Allowlist));
         assert_eq!(classify("ndb"), Some(SigFileKind::Body));
+        assert_eq!(classify("ldb"), Some(SigFileKind::Logical));
+        assert_eq!(classify("ldu"), Some(SigFileKind::Logical));
         // Formats we knowingly do not implement yet.
-        assert_eq!(classify("ldb"), None);
         assert_eq!(classify("cdb"), None);
         assert_eq!(classify("info"), None);
     }

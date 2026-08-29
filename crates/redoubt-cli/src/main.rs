@@ -433,6 +433,7 @@ fn run_db(cfg: &Config, cmd: DbCommand) -> Result<()> {
                 println!("  file hashes    {:>12}", commas(compile.index.file_hashes));
                 println!("  section hashes {:>12}", commas(compile.index.section_hashes));
                 println!("  body patterns  {:>12}", commas(compile.index.body_patterns));
+                println!("  logical rules  {:>12}", commas(compile.index.logical_rules));
                 println!("  allowlisted    {:>12}", commas(compile.index.allowlisted));
                 if compile.malformed() > 0 {
                     println!("  malformed      {:>12}", commas(compile.malformed()));
@@ -484,6 +485,7 @@ fn run_db(cfg: &Config, cmd: DbCommand) -> Result<()> {
             println!("file hashes    {:>12}", commas(stats.file_hashes));
             println!("section hashes {:>12}", commas(stats.section_hashes));
             println!("body patterns  {:>12}", commas(stats.body_patterns));
+            println!("logical rules  {:>12}", commas(stats.logical_rules));
             println!("allowlisted    {:>12}", commas(stats.allowlisted));
             println!("               {:>12}  total", commas(stats.total()));
             println!();

@@ -68,6 +68,7 @@ pub enum ScanOutcome {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EngineStats {
     pub db_version: u32,
+    pub logical_rules: u64,
     /// When the newest source database was built, as a Unix timestamp.
     pub built_epoch: u64,
     pub file_hashes: u64,
@@ -115,6 +116,7 @@ impl ScanEngine {
         let s = self.index.stats();
         EngineStats {
             db_version: self.index.db_version(),
+            logical_rules: s.logical_rules,
             built_epoch: self.index.built_epoch(),
             file_hashes: s.file_hashes,
             section_hashes: s.section_hashes,

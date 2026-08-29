@@ -226,6 +226,7 @@ fn status_json(app: &App) -> serde_json::Value {
                 "file_hashes": s.file_hashes,
                 "section_hashes": s.section_hashes,
                 "body_patterns": s.body_patterns,
+                "logical_rules": s.logical_rules,
                 "allowlisted": s.allowlisted,
                 "yara_rules": s.yara_rules,
                 "index_bytes": index_bytes,

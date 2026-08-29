@@ -23,7 +23,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::compile::{compile_dir, CompileReport};
+use crate::compile::{compile_dir_with, CompileReport};
 use crate::config::Config;
 
 /// A third-party signature file fetched directly over HTTPS.
@@ -506,7 +506,11 @@ pub fn update(
     let mut report = UpdateReport { freshclam, direct, recompiled: None };
     if !pruned.is_empty() || report.anything_changed() || force || !index_path.exists() {
         progress("compiling index...");
-        report.recompiled = Some(compile_dir(dir, index_path)?);
+        report.recompiled = Some(compile_dir_with(
+            dir,
+            index_path,
+            cfg.scan.min_logical_pattern_bytes,
+        )?);
     }
 
     if report.recompiled.is_none() && !index_path.exists() {

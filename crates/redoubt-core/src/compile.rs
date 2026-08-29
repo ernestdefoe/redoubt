@@ -38,6 +38,8 @@ pub struct CompileReport {
     pub sections: ParseStats,
     pub allowlist: ParseStats,
     pub body: ParseStats,
+    /// Logical signature outcomes.
+    pub logical: crate::ldb::LdbStats,
     /// Hash signatures refused because they match a zero-length file.
     pub degenerate_rejected: u64,
     /// Signature files whose format this engine does not handle, as
@@ -58,6 +60,9 @@ impl CompileReport {
             + self.sections.unsupported
             + self.allowlist.unsupported
             + self.body.unsupported
+            + self.logical.unsupported_expression
+            + self.logical.unsupported_subsignature
+            + self.logical.too_short
     }
 
     /// Lines that could not be parsed at all.
@@ -66,6 +71,7 @@ impl CompileReport {
             + self.sections.malformed
             + self.allowlist.malformed
             + self.body.malformed
+            + self.logical.malformed
     }
 
     /// Fraction of parsed signature lines that made it into the index.
@@ -73,14 +79,16 @@ impl CompileReport {
         let seen = self.hashes.total_seen()
             + self.sections.total_seen()
             + self.allowlist.total_seen()
-            + self.body.total_seen();
+            + self.body.total_seen()
+            + self.logical.total_seen();
         if seen == 0 {
             return 0.0;
         }
         let accepted = self.hashes.accepted
             + self.sections.accepted
             + self.allowlist.accepted
-            + self.body.accepted;
+            + self.body.accepted
+            + self.logical.accepted;
         accepted as f64 / seen as f64
     }
 
@@ -115,11 +123,13 @@ impl CompileReport {
     pub fn summary(&self) -> String {
         format!(
             "{} signatures indexed ({} file hashes, {} section hashes, {} body patterns, \
-             {} allowlisted) from {} source(s); {} unsupported, {:.1}% of parsed lines used",
+             {} logical rules, {} allowlisted) from {} source(s); {} unsupported, \
+             {:.1}% of parsed lines used",
             self.accepted(),
             self.index.file_hashes,
             self.index.section_hashes,
             self.index.body_patterns,
+            self.index.logical_rules,
             self.index.allowlisted,
             self.sources.len(),
             self.unsupported(),
@@ -146,7 +156,7 @@ pub fn describe_format(extension: &str) -> &'static str {
 
 fn format_note(extension: &str) -> &'static str {
     match extension {
-        "ldb" | "ldu" => "logical signatures - multi-pattern boolean rules; the largest gap",
+        "ldb" | "ldu" => "logical signatures - the literal-pattern subset is indexed",
         "cbc" => "ClamAV bytecode - requires their VM; out of scope",
         "cdb" => "container metadata rules (archive/attachment properties)",
         "ftm" => "file type magic definitions",
@@ -221,6 +231,8 @@ pub struct Compiler {
     report: CompileReport,
     db_version: u32,
     built_epoch: u64,
+    /// Shortest literal accepted from a multi-part logical signature.
+    min_logical_pattern: usize,
 }
 
 impl Default for Compiler {
@@ -236,7 +248,15 @@ impl Compiler {
             report: CompileReport::default(),
             db_version: 0,
             built_epoch: 0,
+            min_logical_pattern: crate::ldb::MIN_MULTI_SUBSIG_LEN,
         }
+    }
+
+    /// Set the logical-signature length floor. See
+    /// [`crate::config::ScanLimits::min_logical_pattern_bytes`].
+    pub fn with_min_logical_pattern(mut self, bytes: usize) -> Self {
+        self.min_logical_pattern = bytes;
+        self
     }
 
     /// Feed one signature file's bytes, dispatching on its extension.
@@ -284,6 +304,12 @@ impl Compiler {
                 let b = &mut self.builder;
                 let s = sigs::parse_body_db(data, MIN_BODY_PATTERN_LEN, |sig| b.add_body(sig));
                 self.report.body.merge(s);
+            }
+            SigFileKind::Logical => {
+                let b = &mut self.builder;
+                let floor = self.min_logical_pattern;
+                let s = crate::ldb::parse_ldb_with(data, floor, |sig| b.add_logical(sig));
+                self.report.logical.merge(s);
             }
         }
     }
@@ -357,6 +383,15 @@ pub fn is_signature_input(path: &Path) -> bool {
 /// Containers are added first so their versions establish the index version
 /// before loose third-party files (which carry no version) are folded in.
 pub fn compile_dir(dir: &Path, out: &Path) -> Result<CompileReport> {
+    compile_dir_with(dir, out, crate::ldb::MIN_MULTI_SUBSIG_LEN)
+}
+
+/// Compile a directory with an explicit logical-signature length floor.
+pub fn compile_dir_with(
+    dir: &Path,
+    out: &Path,
+    min_logical_pattern: usize,
+) -> Result<CompileReport> {
     let mut containers = Vec::new();
     let mut loose = Vec::new();
 
@@ -376,7 +411,7 @@ pub fn compile_dir(dir: &Path, out: &Path) -> Result<CompileReport> {
     containers.sort();
     loose.sort();
 
-    let mut compiler = Compiler::new();
+    let mut compiler = Compiler::new().with_min_logical_pattern(min_logical_pattern);
     for path in &containers {
         compiler.add_container(path)?;
     }
@@ -461,7 +496,7 @@ mod tests {
                         "Win.Test.Literal:0:*:5245444f5542542d544553542d5041545445524e\n\
                          Win.Test.Wild:0:*:4d5a??00deadbeefdeadbeefdeadbeef\n",
                     ),
-                    ("test.ldb", "Win.Logical;Engine:81-255,Target:1;0&1;aabb;ccdd\n"),
+                    ("test.ldb", "Win.Logical;Engine:81-255,Target:1;0 & 1 > 5;aabb;ccdd\n"),
                     ("test.info", "ClamAV-VDB metadata\n"),
                 ],
             ),
@@ -475,8 +510,14 @@ mod tests {
         assert_eq!(report.index.body_patterns, 1, "only the literal should index");
         assert_eq!(report.body.unsupported, 1, "the wildcard must be counted, not dropped");
 
-        let skipped: Vec<&str> = report.skipped_files.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(skipped, vec!["test.ldb"], ".info is metadata and must not be reported");
+        assert!(
+            report.skipped_files.is_empty(),
+            ".ldb is now parsed and .info is metadata: {:?}",
+            report.skipped_files
+        );
+        // The fixture's logical rule uses a count expression, so it is counted
+        // as unsupported rather than silently dropped.
+        assert_eq!(report.logical.total_seen(), 1);
 
         let index = crate::sigindex::SigIndex::open(&idx).unwrap();
         assert_eq!(index.db_version(), 27100);
