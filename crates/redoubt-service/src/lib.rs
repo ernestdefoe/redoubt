@@ -669,6 +669,9 @@ mod tests {
         /// pipe, whose name is fixed by design, so only one fixture may be
         /// running at a time.
         _pipe: std::sync::MutexGuard<'static, ()>,
+        /// And held against the *other* test binary, which cargo runs in a
+        /// separate process where an in-process mutex is invisible.
+        _pipe_across_processes: ipc::testlock::PipeLock,
     }
 
     impl Drop for Fixture {
@@ -711,7 +714,12 @@ mod tests {
         cfg.realtime.watch_paths = vec![dir.join("watch")];
 
         let engine = Arc::new(ScanEngine::load(cfg.clone()).unwrap());
-        Fixture { dir, protection: Protection::new(cfg, engine), _pipe: pipe_guard() }
+        Fixture {
+            dir,
+            protection: Protection::new(cfg, engine),
+            _pipe: pipe_guard(),
+            _pipe_across_processes: ipc::testlock::acquire(),
+        }
     }
 
     #[test]

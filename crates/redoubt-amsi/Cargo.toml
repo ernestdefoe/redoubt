@@ -27,3 +27,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_LibraryLoader",
     "Win32_Security",
 ] }
+
+[dev-dependencies]
+# Only the tests need these. The shipped DLL depends on windows-sys and
+# nothing else - it is loaded into every script host on the machine, and an
+# engine or an async runtime in that position would be a liability.
+redoubt-core = { path = "../redoubt-core" }
+redoubt-service = { path = "../redoubt-service" }

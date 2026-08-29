@@ -1948,6 +1948,8 @@ dependencies = [
 name = "redoubt-amsi"
 version = "0.1.0"
 dependencies = [
+ "redoubt-core",
+ "redoubt-service",
  "windows-sys 0.61.2",
 ]
 

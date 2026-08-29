@@ -145,14 +145,25 @@ impl ScanServer {
         let stop = Arc::new(AtomicBool::new(false));
         let counters = Arc::new(IpcCounters::default());
 
+        // Returning before the first pipe instance exists would make
+        // `listening: true` briefly untrue: a client connecting in that window
+        // gets ERROR_FILE_NOT_FOUND, and the provider - correctly - treats
+        // that as "no service" and lets the content run. Small window, but it
+        // is exactly the window when a machine is starting up.
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(1);
+
         let thread = {
             let stop = stop.clone();
             let counters = counters.clone();
             std::thread::Builder::new()
                 .name("redoubt-scan-pipe".into())
-                .spawn(move || accept_loop(engine, stop, counters))
+                .spawn(move || accept_loop(engine, stop, counters, ready_tx))
                 .context("spawning the scan pipe thread")?
         };
+
+        // Bounded: a pipe that cannot be created will not start existing while
+        // we block the caller. The loop reports the real error either way.
+        let _ = ready_rx.recv_timeout(std::time::Duration::from_secs(5));
 
         Ok(Self { stop, thread: Some(thread), counters })
     }
@@ -173,9 +184,20 @@ impl Drop for ScanServer {
     }
 }
 
-fn accept_loop(engine: Arc<ScanEngine>, stop: Arc<AtomicBool>, counters: Arc<IpcCounters>) {
+fn accept_loop(
+    engine: Arc<ScanEngine>,
+    stop: Arc<AtomicBool>,
+    counters: Arc<IpcCounters>,
+    ready: std::sync::mpsc::SyncSender<()>,
+) {
+    // Fires once, when the first instance exists and a client could connect.
+    let mut ready = Some(ready);
     while !stop.load(Ordering::Relaxed) {
-        match pipe::create_and_wait(&stop) {
+        match pipe::create_and_wait(&stop, &mut || {
+            if let Some(tx) = ready.take() {
+                let _ = tx.try_send(());
+            }
+        }) {
             Ok(Some(mut conn)) => {
                 let engine = engine.clone();
                 let counters = counters.clone();
@@ -326,7 +348,14 @@ mod pipe {
     /// Create a pipe instance and block until a client connects.
     ///
     /// Returns `Ok(None)` when `stop` was set while waiting.
-    pub fn create_and_wait(stop: &AtomicBool) -> Result<Option<Connection>> {
+    /// Create one pipe instance and block until a client connects.
+    ///
+    /// `on_created` fires once the instance exists but before waiting, so the
+    /// caller can report readiness without waiting for actual traffic.
+    pub fn create_and_wait(
+        stop: &AtomicBool,
+        on_created: &mut dyn FnMut(),
+    ) -> Result<Option<Connection>> {
         // A null DACL grants everyone access. That is deliberate and needed:
         // AMSI providers load into processes at every integrity level,
         // including sandboxed and low-integrity ones, and a pipe they cannot
@@ -377,6 +406,10 @@ mod pipe {
         // owned.
         let owned = unsafe { OwnedHandle::from_raw_handle(handle as _) };
 
+        // The pipe now exists in the object namespace, so a client that opens
+        // it will queue rather than be told it is missing.
+        on_created();
+
         // SAFETY: `handle` is a valid pipe instance awaiting a client.
         let connected = unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) };
         let ok = connected != 0
@@ -391,6 +424,64 @@ mod pipe {
         Ok(Some(Connection { handle: owned }))
     }
 
+}
+
+/// Serialising tests that bind the scan pipe.
+///
+/// The pipe name is fixed and global, so two test *processes* - this crate's
+/// suite and the AMSI provider's - can collide on it while cargo runs their
+/// binaries in parallel. An in-process mutex cannot see across that boundary,
+/// so this uses a Windows named mutex, which can.
+///
+/// Test-only. Nothing in the running product takes this lock.
+pub mod testlock {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED};
+    use windows_sys::Win32::System::Threading::{
+        CreateMutexW, ReleaseMutex, WaitForSingleObject, INFINITE,
+    };
+
+    /// Released on drop, including when a test panics while holding it.
+    pub struct PipeLock(HANDLE);
+
+    // The handle is owned solely by this value and only ever released by it.
+    unsafe impl Send for PipeLock {}
+
+    impl Drop for PipeLock {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: acquired by the matching wait in `acquire`.
+                unsafe {
+                    ReleaseMutex(self.0);
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    /// Block until no other test process holds the scan pipe.
+    ///
+    /// A failure to create or wait on the mutex is deliberately not fatal:
+    /// tests then run unserialised, which is the behaviour before this
+    /// existed, rather than failing for a reason unrelated to what they test.
+    pub fn acquire() -> PipeLock {
+        let name: Vec<u16> = r"Local\Redoubt.ScanPipe.Test"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        // SAFETY: `name` is NUL-terminated; a default-security named mutex.
+        let h = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+        if h.is_null() {
+            return PipeLock(std::ptr::null_mut());
+        }
+        // SAFETY: `h` is a mutex handle we just created.
+        if unsafe { WaitForSingleObject(h, INFINITE) } == WAIT_FAILED {
+            // SAFETY: not held, so only the handle needs closing.
+            unsafe { CloseHandle(h) };
+            return PipeLock(std::ptr::null_mut());
+        }
+        PipeLock(h)
+    }
 }
 
 #[cfg(test)]
