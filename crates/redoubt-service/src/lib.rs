@@ -22,6 +22,7 @@
 //! nonsense. Paths are therefore held for a short settle period and coalesced,
 //! so one copy costs one scan.
 
+pub mod install;
 pub mod process;
 pub mod ransomware;
 pub mod watcher;

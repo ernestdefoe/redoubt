@@ -16,20 +16,24 @@ anything until you explicitly turn enforcement on.
 | Component | State |
 |---|---|
 | Signature engine (hashes, sections, body patterns) | **Working** |
+| Logical signatures (ClamAV `.ldb`) | **Working** — 48,931 rules |
 | YARA engine | **Working** — 3,021 rules |
+| Archive scanning (zip, gzip, nested) | **Working** |
 | Heuristics | **Working** — tuned against a real System32 sweep |
 | Signature + rule updating | **Working** |
 | On-demand scanning | **Working** |
 | Real-time protection | **Working** — file watching, detect-and-react |
+| Ransomware detection | **Working** — behavioural, five signals |
+| Process attribution + termination | **Working** — opt-in, two switches |
 | Quarantine + restore | **Working** |
 | Desktop interface | **Working** |
-| Disk cleanup | **Working** |
-| Startup manager | **Working** |
+| Disk cleanup + startup manager | **Working** |
+| Windows service registration | **Working** — `redoubtd install` |
 | AMSI provider (script blocking) | Not built |
 | Filesystem minifilter (pre-execution blocking) | Not built |
-| Windows service registration | Not built |
+| Network C2 blocking | Not built |
 
-194 tests.
+293 tests.
 
 ---
 
@@ -49,6 +53,42 @@ Five engines, each independently switchable:
 Signatures in ClamAV's `PUA.` namespace map to `suspicious` rather than
 `malicious` — Windows' own `MRT.exe` trips two packer signatures, and reporting
 that as malware on a stock install destroys trust in the tool.
+
+## Ransomware
+
+Signatures cannot catch ransomware: by the time a sample is known the family
+has rebuilt, and the damaging step is not a file arriving but thousands of
+*existing* files being rewritten. Five behavioural signals run off the same
+event stream:
+
+1. **Decoy files** planted in the watched folders. Nothing legitimate touches
+   them, so this is the strongest signal available and alerts on its own.
+   They are deliberately **not hidden** — a great deal of ransomware skips
+   hidden files, which would have silently disabled the whole mechanism.
+2. **Ransom-note filenames** appearing next to your documents.
+3. **Known extensions** — `.locky`, `.wncry` and friends.
+4. **Modification bursts** — many files rewritten quickly.
+5. **Entropy rise** — a `.txt` whose contents are now indistinguishable from
+   random.
+
+Bursts and entropy never alert alone: builds and sync clients produce both all
+day, and an alert that fires during an `npm install` is an alert nobody reads.
+
+### Attribution
+
+The file watcher reports paths, not who touched them. Redoubt closes that by
+sampling per-process write volume continuously and reporting whatever is
+writing far above *its own* normal rate.
+
+That is **context, not proof**, and it is described that way because testing
+proved it needs to be. Ranking by absolute write rate confidently named the
+browser and editor — simply the busiest processes present.
+
+Automatic termination therefore ignores that list. It uses a *decisive*
+candidate: one process clearly ahead of the runner-up on both anomaly and
+volume. If two are plausible, nothing is terminated and the alert says so.
+It also requires enforce mode **and** an explicitly enabled setting that is off
+by default — two switches, because being wrong here is destructive.
 
 ## Real-time protection
 
@@ -143,6 +183,8 @@ redoubt scan C:\Users\me\Downloads
 redoubt optimize analyze   # measure reclaimable space
 redoubt optimize startup   # what starts with Windows
 redoubtd                   # resident protection, headless
+redoubtd install           # register as a Windows service (needs admin)
+redoubtd status            # is the service installed and running?
 ```
 
 Useful flags on `scan`: `--show-clean`, `--show-skipped` (what was *not*
@@ -165,19 +207,26 @@ enforceable regardless of mode.
 Stated plainly, because a scanner that quietly covers less than it claims is
 worse than one that admits what it misses.
 
-- **ClamAV `.ldb` logical signatures are not evaluated** — ~86 MB of signature
-  data, and the single largest detection gap. They are multi-pattern boolean
-  rules needing a matcher this engine does not have.
+- **Half of the logical signatures are still unusable.** 51% of ClamAV's
+  273,000 `.ldb` rules use only literal patterns and plain `&`/`|`; the rest
+  need PCRE subsignatures, byte ranges or match-count operators. Of the
+  supportable half, the default length floor keeps 48,931 — raise coverage
+  with `scan.min_logical_pattern_bytes = 4` at a cost of ~200 MB resident.
 - **`.ndb` patterns using wildcards are skipped.** Only literal patterns of 16+
   bytes are indexed; `redoubt db update` reports how many were refused.
 - **No pre-execution blocking.** That needs a filesystem minifilter. Script
-  blocking needs an AMSI provider. Neither is built.
+  blocking needs an AMSI provider. Neither is built, so a malicious script run
+  from PowerShell is not stopped before it executes.
+- **No network blocking.** C2 callbacks and exfiltration are not intercepted.
+- **Ransomware attribution cannot see which process wrote which file.** It is
+  inferred from I/O behaviour and can name nobody.
+- **Resident memory is ~400 MB**, dominated by the pattern-matching automaton.
+  `scan.min_logical_pattern_bytes` is the dial; the measured trade-off is in
+  its doc comment.
 - **`.cbc` bytecode is out of scope permanently** — it needs ClamAV's VM.
 - **CVD digital signatures are not verified.** Integrity rests on HTTPS from the
   official mirror.
 - **No archive expansion yet.** `scan.archive_depth` exists but is not wired up.
-- **Not registered as a Windows service.** `redoubtd` runs in the foreground.
-
 `redoubt db update` prints a per-format breakdown of everything it could not
 index, with an explanation of each. The interface shows the same thing under
 Signatures → Not indexed.
