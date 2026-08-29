@@ -25,6 +25,7 @@
 pub mod elevate;
 pub mod install;
 pub mod ipc;
+pub mod netblock;
 pub mod process;
 pub mod ransomware;
 pub mod watcher;
@@ -124,6 +125,7 @@ pub struct Status {
     pub ransomware: RansomwareStatus,
     /// The scan channel the AMSI provider talks to.
     pub scan_channel: ScanChannelStatus,
+    pub network: NetworkStatus,
     /// Plain statement of the protection level. Never dressed up.
     pub note: String,
 }
@@ -143,6 +145,24 @@ pub struct ScanChannelStatus {
     pub requests: u64,
     pub malicious: u64,
     pub suspicious: u64,
+}
+
+/// Outbound connection blocking.
+#[derive(Debug, Clone, Serialize)]
+pub struct NetworkStatus {
+    /// Turned on in the configuration.
+    pub enabled: bool,
+    /// Filters are installed right now.
+    pub enforcing: bool,
+    /// Whether this process could install them at all. False in the
+    /// interface, which is not elevated - reported so the page can explain
+    /// that rather than show a permission error to somebody blameless.
+    pub available: bool,
+    pub ranges: usize,
+    pub filters: usize,
+    pub sources: Vec<String>,
+    /// Why it is not enforcing, when it is not. Empty when it is.
+    pub note: String,
 }
 
 /// What the ransomware guard is doing.
@@ -185,6 +205,7 @@ pub struct Protection {
     /// Serves scan requests from the AMSI provider, which cannot hold an
     /// engine of its own - it is loaded into every AMSI host on the machine.
     scan_server: Arc<Mutex<Option<ipc::ScanServer>>>,
+    netblock: Arc<Mutex<Option<netblock::NetBlocker>>>,
 }
 
 fn now_epoch() -> u64 {
@@ -220,6 +241,7 @@ impl Protection {
             workers: Arc::new(Mutex::new(Vec::new())),
             proc_thread: Arc::new(Mutex::new(None)),
             scan_server: Arc::new(Mutex::new(None)),
+            netblock: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -291,6 +313,17 @@ impl Protection {
             Err(e) => tracing::error!(error = %e, "scan channel unavailable"),
         }
 
+        // Outbound blocking. Off unless asked for, and a failure here is
+        // reported rather than fatal: losing C2 blocking is bad, losing file
+        // scanning because of it would be worse.
+        if self.inner.cfg.network.enabled {
+            match self.start_netblock() {
+                Ok(n) if n > 0 => tracing::info!(filters = n, "outbound blocking active"),
+                Ok(_) => tracing::warn!("outbound blocking on, but no addresses to block"),
+                Err(e) => tracing::error!(error = %e, "outbound blocking unavailable"),
+            }
+        }
+
         tracing::info!(
             roots = roots.len(),
             workers = worker_count,
@@ -319,6 +352,10 @@ impl Protection {
         if let Some(mut server) = self.scan_server.lock().take() {
             server.stop();
         }
+        // Dropping the blocker closes its dynamic WFP session, which is what
+        // removes the filters. Leaving them behind would cut the machine off
+        // with nothing running to explain why.
+        *self.netblock.lock() = None;
 
         // Decoys are ours; do not leave them in the user's folders.
         self.inner.guard.remove_canaries();
@@ -344,6 +381,31 @@ impl Protection {
                 will_terminate: self.inner.cfg.ransomware.terminate_on_critical
                     && self.inner.cfg.mode == Mode::Enforce,
                 alerts: self.inner.guard.alerts(),
+            },
+            network: {
+                // Everything is read out of the lock and the guard dropped
+                // before anything slow happens. Holding it across a filtering
+                // engine call wedged every request on the machine: status is
+                // polled every couple of seconds, and one blocked call there
+                // takes the whole interface with it.
+                let (enforcing, ranges, filters, sources) = {
+                    let n = self.netblock.lock();
+                    (
+                        n.is_some(),
+                        n.as_ref().map(|b| b.blocked_ranges()).unwrap_or(0),
+                        n.as_ref().map(|b| b.filters_installed()).unwrap_or(0),
+                        n.as_ref().map(|b| b.sources().to_vec()).unwrap_or_default(),
+                    )
+                };
+                NetworkStatus {
+                    enabled: self.inner.cfg.network.enabled,
+                    enforcing,
+                    available: enforcing || netblock::available(),
+                    ranges,
+                    filters,
+                    sources,
+                    note: self.network_note(enforcing),
+                }
             },
             scan_channel: {
                 let server = self.scan_server.lock();
@@ -371,6 +433,48 @@ impl Protection {
             },
             note: self.note(),
         }
+    }
+
+    /// Load the blocklists and install filters for them.
+    fn start_netblock(&self) -> Result<usize> {
+        let list = redoubt_core::blocklist::Blocklist::load_dir(&self.inner.cfg.paths.blocklists);
+        if list.stats.refused_protected > 0 {
+            // Worth saying out loud. A feed asking to block loopback or the
+            // local network is either broken or hostile, and either way the
+            // person should hear about it rather than have it silently
+            // dropped.
+            tracing::warn!(
+                refused = list.stats.refused_protected,
+                "blocklist entries covering loopback or private networks were refused"
+            );
+        }
+
+        let mut blocker = netblock::NetBlocker::open()?;
+        let installed = blocker.apply(&list)?;
+        *self.netblock.lock() = Some(blocker);
+        Ok(installed)
+    }
+
+    /// Why outbound blocking is not enforcing, in words meant for a person.
+    fn network_note(&self, enforcing: bool) -> String {
+        if enforcing {
+            return String::new();
+        }
+        if !self.inner.cfg.network.enabled {
+            return "Off. Outbound connections are not filtered.".into();
+        }
+        if !self.is_running() {
+            return "Waiting for protection to start.".into();
+        }
+        let dir = &self.inner.cfg.paths.blocklists;
+        if redoubt_core::blocklist::Blocklist::load_dir(dir).is_empty() {
+            return format!(
+                "On, but there are no addresses to block. Put a list of                  addresses in {}.",
+                dir.display()
+            );
+        }
+        "On, but filters could not be installed. This needs the Redoubt          service, which runs with the rights required."
+            .into()
     }
 
     /// Ransomware alerts raised so far, newest last.

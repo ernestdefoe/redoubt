@@ -48,7 +48,31 @@ pub struct Config {
     pub heuristics: Heuristics,
     pub exclusions: Exclusions,
     pub ransomware: Ransomware,
+    pub network: Network,
     pub updates: Updates,
+}
+
+/// Outbound connection blocking.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Network {
+    /// Block outbound connections to known command-and-control addresses.
+    ///
+    /// Off by default. Unlike scanning, this has no observe mode to fall back
+    /// on - deciding needs no driver but *watching* does - so the only honest
+    /// choices are blocking and not blocking. Turning it on is therefore a
+    /// deliberate act, not something that happens to somebody on install.
+    pub enabled: bool,
+}
+
+impl Default for Network {
+    // Spelled out rather than derived: `false` here is a deliberate decision
+    // about somebody's network, and it should be visible at the point where
+    // it is made.
+    #[allow(clippy::derivable_impls)]
+    fn default() -> Self {
+        Self { enabled: false }
+    }
 }
 
 /// Behavioural ransomware detection.
@@ -105,6 +129,7 @@ impl Default for Config {
             engines: Engines::default(),
             heuristics: Heuristics::default(),
             exclusions: Exclusions::default(),
+            network: Network::default(),
             ransomware: Ransomware::default(),
             updates: Updates::default(),
         }
@@ -125,6 +150,8 @@ pub struct Paths {
     pub logs: PathBuf,
     /// Persistent verdict cache.
     pub cache: PathBuf,
+    /// Lists of addresses nothing on this machine may connect to.
+    pub blocklists: PathBuf,
 }
 
 impl Default for Paths {
@@ -136,6 +163,7 @@ impl Default for Paths {
             quarantine: root.join("quarantine"),
             logs: root.join("logs"),
             cache: root.join("cache"),
+            blocklists: root.join("blocklists"),
         }
     }
 }

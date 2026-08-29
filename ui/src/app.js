@@ -305,6 +305,39 @@ function renderSetup(status, svc) {
   }
 
   SETUP = { registered, installed, running };
+
+  renderNetwork(status?.realtime?.network);
+}
+
+/** Outbound connection blocking.
+ *
+ * The counters only appear when filters are actually installed. Showing
+ * "0 addresses blocked" next to an on switch reads as working-but-quiet, when
+ * it in fact means nothing is being blocked at all.
+ */
+function renderNetwork(net) {
+  const enabled = !!net?.enabled;
+  const enforcing = !!net?.enforcing;
+
+  $("#toggle-network").checked = enabled;
+  const badge = $("#net-badge");
+  badge.textContent = enforcing ? "blocking" : enabled ? "not active" : "off";
+  badge.className = `badge badge-sm ${
+    enforcing ? "badge-success" : enabled ? "badge-warning" : "badge-ghost"
+  }`;
+
+  $("#net-note").textContent =
+    net?.note ||
+    "Outbound connections to known command-and-control addresses are blocked.";
+
+  const counters = $("#net-counters");
+  counters.classList.toggle("hidden", !enforcing);
+  counters.classList.toggle("grid", enforcing);
+  if (enforcing) {
+    $("#net-ranges").textContent = num(net.ranges ?? 0);
+    $("#net-filters").textContent = num(net.filters ?? 0);
+    $("#net-sources").textContent = (net.sources ?? []).join(", ") || "—";
+  }
 }
 
 /** What the setup buttons should do next. Set by renderSetup. */
@@ -1106,6 +1139,24 @@ function wire() {
     } catch (e) {
       toggle.checked = !enable;
       toast(e.message, "error");
+    }
+  });
+
+  $("#toggle-network").addEventListener("change", async (e) => {
+    const on = e.currentTarget.checked;
+    try {
+      await saveConfig({ network: { enabled: on } });
+      toast(
+        on
+          ? "Network blocking on. It takes effect when protection restarts."
+          : "Network blocking off.",
+        "success",
+      );
+      await refresh();
+    } catch (err) {
+      // Never leave the switch showing a state the service is not in.
+      e.currentTarget.checked = !on;
+      toast(err.message, "error");
     }
   });
 

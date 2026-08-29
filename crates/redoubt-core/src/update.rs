@@ -35,7 +35,7 @@ pub struct DirectSource {
 }
 
 /// Identify ourselves honestly. Nothing here pretends to be another client.
-fn user_agent() -> String {
+pub fn user_agent() -> String {
     format!("Redoubt/{} (+https://github.com/ernestdefoe/redoubt)", crate::VERSION)
 }
 

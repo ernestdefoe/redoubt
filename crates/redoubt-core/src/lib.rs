@@ -13,6 +13,8 @@
 
 pub mod archive;
 pub mod bodyscan;
+pub mod blocklist;
+pub mod blocklistupdate;
 pub mod cache;
 pub mod compile;
 pub mod config;

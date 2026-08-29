@@ -384,13 +384,43 @@ fn spawn_db_update(app: Arc<App>, id: u64, handle: jobs::JobHandle) {
             handle.lock().current = line.to_string();
         });
 
+        // Address feeds ride along with the signature update: they are the
+        // same kind of thing - somebody else's list of what is dangerous -
+        // and a person who pressed Update meant both. Kept out of the pass or
+        // fail above, because a feed being down is not a reason to report that
+        // signatures failed.
+        handle.lock().current = "Updating address blocklists...".into();
+        let feed_note = match redoubt_core::blocklistupdate::update(
+            &cfg.paths.blocklists,
+            &redoubt_core::blocklistupdate::default_feeds(),
+        ) {
+            Ok(reports) => {
+                let total: usize = reports.iter().map(|r| r.addresses).sum();
+                let failed: Vec<&str> = reports
+                    .iter()
+                    .filter(|r| r.error.is_some())
+                    .map(|r| r.name.as_str())
+                    .collect();
+                if failed.is_empty() {
+                    Some(format!("{total} blocked addresses"))
+                } else {
+                    Some(format!("{total} blocked addresses ({} unavailable)", failed.join(", ")))
+                }
+            }
+            Err(e) => Some(format!("blocklists unavailable: {e}")),
+        };
+
         let state = match result {
             Ok(report) => {
                 let mut job = handle.lock();
-                job.summary = Some(match &report.recompiled {
+                let mut summary = match &report.recompiled {
                     Some(c) => c.summary(),
                     None => "Signatures already up to date".to_string(),
-                });
+                };
+                if let Some(note) = &feed_note {
+                    summary.push_str(&format!("; {note}"));
+                }
+                job.summary = Some(summary);
                 let warnings = report.warnings();
                 if !warnings.is_empty() {
                     job.error = Some(warnings.join("; "));
@@ -549,14 +579,23 @@ fn handle(app: &Arc<App>, request: &mut tiny_http::Request) -> tiny_http::Respon
                     cfg.ransomware = r;
                 }
             }
+            if let Some(n) = patch.get("network") {
+                if let Ok(n) = serde_json::from_value(n.clone()) {
+                    cfg.network = n;
+                }
+            }
             let saved = cfg.save(&app.config_path);
-            let cfg = cfg.clone();
-            drop(app.cfg.write());
+            let updated = cfg.clone();
+            // Release the write guard. This used to read `drop(app.cfg.write())`,
+            // which takes a *second* write lock while the first is still held -
+            // a self-deadlock that hung every settings toggle in the interface.
+            // It looked like a drop; it was an acquisition.
+            drop(cfg);
             match saved {
                 Ok(()) => {
                     // Engine switches change what runs, so rebuild.
                     let _ = app.reload_engine();
-                    json_response(serde_json::to_value(cfg).unwrap_or(json!({})), 200)
+                    json_response(serde_json::to_value(updated).unwrap_or(json!({})), 200)
                 }
                 Err(e) => json_response(json!({ "error": format!("{e:#}") }), 500),
             }

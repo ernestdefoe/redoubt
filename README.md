@@ -34,9 +34,9 @@ anything until you explicitly turn enforcement on.
 | UTF-16 script content | **Working** — PowerShell's own encoding |
 | Windows installer (MSI) | **Working** — `installer/build.ps1` |
 | Filesystem minifilter (pre-execution blocking) | Not built |
-| Network C2 blocking | Not built |
+| Network C2 blocking | **Working** — WFP, no driver needed |
 
-349 tests.
+369 tests.
 
 ---
 
