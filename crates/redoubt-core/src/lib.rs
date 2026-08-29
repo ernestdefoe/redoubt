@@ -11,6 +11,7 @@
 //! - [`sigs`]     - parsers for the signature text formats inside them
 //! - [`sigindex`] - the compiled, memory-mapped index those parsers feed
 
+pub mod archive;
 pub mod bodyscan;
 pub mod cache;
 pub mod compile;

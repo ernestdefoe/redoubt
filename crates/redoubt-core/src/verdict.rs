@@ -134,6 +134,13 @@ pub struct Verdict {
     /// suppressed what would otherwise have been a detection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowlisted_as: Option<String>,
+    /// Parts of an archive that could not be examined - a bomb that hit its
+    /// cap, a corrupt entry, nesting past the depth limit.
+    ///
+    /// A non-empty list means this file was scanned *incompletely*, which is a
+    /// different answer from clean and is surfaced as such.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub archive_limits: Vec<String>,
 }
 
 impl Verdict {
@@ -146,7 +153,13 @@ impl Verdict {
             scan_micros,
             cached: false,
             allowlisted_as: None,
+            archive_limits: Vec::new(),
         }
+    }
+
+    /// True when part of this file could not be examined.
+    pub fn is_partial(&self) -> bool {
+        !self.archive_limits.is_empty()
     }
 
     /// Recompute `severity` from the current detection list.

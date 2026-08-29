@@ -158,9 +158,24 @@ pub fn entries() -> Vec<Entry> {
             }
         }
 
-        // Anything Redoubt has parked.
+        // Anything Redoubt has parked, excluding names that are also live in
+        // the Run key.
+        //
+        // Disabling writes the backup *before* deleting the Run value, so
+        // both exist for an instant - and permanently if the machine stops in
+        // between. The Run key is authoritative for whether something starts,
+        // so a name present there is reported once, as enabled. Without this
+        // the same entry appears twice with contradictory states.
         if let Some(backup) = backup_key(source, false) {
             for (name, value) in backup.enum_values().flatten() {
+                if out.iter().any(|e| e.source == source && e.name == name) {
+                    tracing::debug!(
+                        %name,
+                        "startup entry is in both the Run key and the backup; \
+                         treating the Run key as authoritative"
+                    );
+                    continue;
+                }
                 let command = value.to_string();
                 out.push(Entry {
                     id: make_id(source, &name),
@@ -195,6 +210,21 @@ pub fn entries() -> Vec<Entry> {
             } else {
                 file_name
             };
+
+            // Same rule as the registry: if both `X.lnk` and `X.lnk.disabled`
+            // exist - which a crash mid-rename leaves behind - the live file
+            // wins and the entry is reported once.
+            if let Some(existing) = out
+                .iter_mut()
+                .find(|e| e.source == source && e.name == name)
+            {
+                if !disabled {
+                    existing.enabled = true;
+                    existing.command = path.to_string_lossy().into_owned();
+                    existing.image = Some(path);
+                }
+                continue;
+            }
 
             out.push(Entry {
                 id: make_id(source, &name),
@@ -294,6 +324,19 @@ pub fn enable(id: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Serialises the tests that mutate the machine's real `Run` key.
+    ///
+    /// Cargo runs tests in parallel threads within one process, and these
+    /// share a single global resource. Without this, the enumeration test can
+    /// observe another test's entry mid-write and report a duplicate - a
+    /// property of the test harness, not of the code under test.
+    static REGISTRY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the registry lock, ignoring poisoning from an unrelated failure.
+    fn registry_guard() -> std::sync::MutexGuard<'static, ()> {
+        REGISTRY.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn parses_a_quoted_command() {
         assert_eq!(
@@ -365,13 +408,17 @@ mod tests {
 
     #[test]
     fn enumerating_this_machine_returns_coherent_entries() {
-        // Read-only, so it is safe to run against the real registry.
+        // Read-only, but it must not run while another test is mid-write.
+        let _guard = registry_guard();
+
         let all = entries();
-        let mut ids: Vec<&str> = all.iter().map(|e| e.id.as_str()).collect();
-        ids.sort_unstable();
-        let before = ids.len();
-        ids.dedup();
-        assert_eq!(before, ids.len(), "duplicate startup entry ids");
+        let mut seen = std::collections::HashSet::new();
+        let dupes: Vec<&str> = all
+            .iter()
+            .filter(|e| !seen.insert(e.id.as_str()))
+            .map(|e| e.id.as_str())
+            .collect();
+        assert!(dupes.is_empty(), "duplicate startup entry ids: {dupes:?}");
 
         for e in &all {
             assert!(!e.name.is_empty());
@@ -381,8 +428,38 @@ mod tests {
     }
 
     #[test]
+    fn an_entry_in_both_the_run_key_and_the_backup_is_reported_once() {
+        // Disabling writes the backup before deleting the Run value. A crash
+        // in between leaves both, permanently. Reporting the entry twice with
+        // contradictory states is how a UI ends up showing a toggle that flips
+        // itself back.
+        let _guard = registry_guard();
+        let name = format!("RedoubtDup_{}", std::process::id());
+        let command = r"C:\Redoubt	est
+ever-runs.exe";
+
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let run = hkcu.open_subkey_with_flags(RUN_PATH, KEY_ALL_ACCESS).unwrap();
+        run.set_value(&name, &command).unwrap();
+        let backup = backup_key(Source::UserRun, true).unwrap();
+        backup.set_value(&name, &command).unwrap();
+
+        let all = entries();
+        let matching: Vec<&Entry> = all.iter().filter(|e| e.name == name).collect();
+        assert_eq!(matching.len(), 1, "the entry should appear exactly once");
+        assert!(
+            matching[0].enabled,
+            "the Run key is authoritative, so it should read as enabled"
+        );
+
+        run.delete_value(&name).ok();
+        backup.delete_value(&name).ok();
+    }
+
+    #[test]
     fn a_disable_and_enable_round_trip_preserves_the_command() {
         // Uses HKCU only, and a name nothing else will touch.
+        let _guard = registry_guard();
         let name = format!("RedoubtTest_{}", std::process::id());
         let command = r#""C:\Redoubt\test\never-runs.exe" --flag"#;
 

@@ -23,6 +23,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::archive;
 use crate::bodyscan::{BodyScanner, FileKind};
 use crate::config::Config;
 use crate::hashing;
@@ -300,7 +301,38 @@ impl ScanSession<'_> {
             }
         }
 
-        // --- 6. Heuristics ---
+        // --- 6. Archives ---
+        //
+        // Run before heuristics so a payload found inside a container is what
+        // determines severity, not the container's own shape. A detection
+        // inside an archive is attributed to the *outer* file, because that is
+        // the thing the user has and the thing enforcement would act on.
+        if cfg.scan.archive_depth > 0 {
+            let limits = archive::Limits::from_config(&cfg.scan);
+            if archive::Format::sniff(data).is_some() {
+                let outer = path.file_name().map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                let extraction = archive::extract(data, &outer, &limits);
+
+                for member in &extraction.members {
+                    // Members are scanned with the engines that make sense for
+                    // loose bytes. Recursing through `scan_bytes` would re-run
+                    // archive expansion, which `extract` has already done.
+                    for d in self.scan_member(&member.path, &member.data) {
+                        verdict.detections.push(d);
+                    }
+                }
+
+                // Anything we could not look inside is stated, not implied
+                // clean. A truncated bomb or a corrupt entry means reduced
+                // coverage for this file.
+                for limit in &extraction.limits_hit {
+                    verdict.archive_limits.push(limit.to_string());
+                }
+            }
+        }
+
+        // --- 7. Heuristics ---
         if cfg.engines.heuristics {
             verdict
                 .detections
@@ -310,6 +342,67 @@ impl ScanSession<'_> {
         verdict.recompute_severity();
         verdict.scan_micros = started.elapsed().as_micros() as u64;
         verdict
+    }
+
+    /// Scan one archive member's bytes.
+    ///
+    /// Deliberately not a recursive call into `scan_bytes`: extraction has
+    /// already walked the nesting, and re-entering would expand the same
+    /// containers a second time.
+    fn scan_member(&mut self, label: &str, data: &[u8]) -> Vec<Detection> {
+        let cfg = &self.engine.cfg;
+        let index = &self.engine.index;
+        let size = data.len() as u64;
+        let mut out = Vec::new();
+
+        if data.is_empty() {
+            return out;
+        }
+
+        let digests = hashing::digest_bytes(data);
+
+        // The allowlist applies inside archives too: a known-good file does
+        // not become malicious by being zipped.
+        for hash in digests.all() {
+            if index.is_allowlisted(&hash, size).is_some() {
+                return out;
+            }
+        }
+
+        if cfg.engines.hash {
+            for hash in digests.all() {
+                if let Some(name) = index.lookup(&hash, Group::File, size) {
+                    out.push(
+                        Detection::new(name, Engine::Hash, crate::sigs::implied_severity(name))
+                            .with_detail(format!("inside archive: {label}")),
+                    );
+                    break;
+                }
+            }
+        }
+
+        if cfg.engines.body_pattern && !self.engine.body.is_empty() {
+            let kind = FileKind::sniff(data);
+            for m in self.engine.body.scan(data, kind, MAX_BODY_MATCHES) {
+                let severity = crate::sigs::implied_severity(&m.name);
+                out.push(
+                    Detection::new(m.name, Engine::BodyPattern, severity)
+                        .with_detail(format!("inside archive: {label}")),
+                );
+            }
+        }
+
+        if let Some(yara) = self.yara.as_mut() {
+            if let Ok(hits) = yara.scan(data) {
+                for h in hits {
+                    let mut d = h.to_detection();
+                    d = d.with_detail(format!("inside archive: {label}"));
+                    out.push(d);
+                }
+            }
+        }
+
+        out
     }
 
     /// Verdict for a file too large to pattern-scan: hashes only.
@@ -707,6 +800,107 @@ mod tests {
         assert_eq!(v.severity, Severity::Suspicious);
         assert!(!v.severity.is_actionable(), "a packer must never be auto-quarantined");
         assert_eq!(v.detections[0].name, "PUA.Win.Packer.Testpack-1");
+    }
+
+    /// Build a zip containing `files`, using stored (uncompressed) entries so
+    /// the fixture needs no compression feature.
+    fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            for (name, data) in files {
+                w.start_file(*name, opts).unwrap();
+                w.write_all(data).unwrap();
+            }
+            w.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn a_payload_inside_a_zip_is_detected() {
+        // The whole point of archive scanning: the outer bytes match nothing,
+        // and only the member carries the signature.
+        let f = fixture("zip");
+        let mut s = f.engine.session();
+
+        let mut payload = vec![b'.'; 200];
+        payload.extend_from_slice(BODY_MARKER);
+        let archive = zip_of(&[("readme.txt", b"harmless"), ("payload.bin", &payload)]);
+
+        let v = s.scan_bytes(Path::new("delivery.zip"), &archive);
+        assert_eq!(v.severity, Severity::Malicious, "{:?}", v.detections);
+
+        let d = v.detections.iter().find(|d| d.engine == Engine::BodyPattern).unwrap();
+        assert_eq!(d.name, "Redoubt.Test.BodyMarker");
+        assert!(
+            d.detail.as_ref().unwrap().contains("payload.bin"),
+            "the detection should name the member it came from: {:?}",
+            d.detail
+        );
+    }
+
+    #[test]
+    fn a_payload_nested_two_archives_deep_is_detected() {
+        let f = fixture("zipnested");
+        let mut s = f.engine.session();
+
+        let mut payload = vec![b'.'; 50];
+        payload.extend_from_slice(BODY_MARKER);
+        let inner = zip_of(&[("payload.bin", &payload)]);
+        let outer = zip_of(&[("inner.zip", &inner)]);
+
+        let v = s.scan_bytes(Path::new("delivery.zip"), &outer);
+        assert_eq!(v.severity, Severity::Malicious, "{:?}", v.detections);
+    }
+
+    #[test]
+    fn a_clean_archive_stays_clean() {
+        let f = fixture("zipclean");
+        let mut s = f.engine.session();
+        let archive = zip_of(&[("a.txt", b"nothing"), ("b.txt", b"interesting")]);
+
+        let v = s.scan_bytes(Path::new("ordinary.zip"), &archive);
+        assert!(v.is_clean(), "{:?}", v.detections);
+        assert!(!v.is_partial(), "a small clean archive is fully examined");
+    }
+
+    #[test]
+    fn archive_scanning_respects_the_depth_setting() {
+        let f = fixture("zipdepth");
+        let mut cfg = f.engine.config().clone();
+        cfg.scan.archive_depth = 0;
+        let engine = ScanEngine::load(cfg).unwrap();
+        let mut s = engine.session();
+
+        let mut payload = vec![b'.'; 50];
+        payload.extend_from_slice(BODY_MARKER);
+        let archive = zip_of(&[("payload.bin", &payload)]);
+
+        let v = s.scan_bytes(Path::new("delivery.zip"), &archive);
+        assert!(v.is_clean(), "depth 0 must disable archive expansion entirely");
+    }
+
+    #[test]
+    fn an_unexaminable_archive_is_reported_as_partial() {
+        // A bomb that hits its cap is not a clean result.
+        let f = fixture("zipbomb");
+        let mut cfg = f.engine.config().clone();
+        cfg.scan.max_archive_entry_bytes = 1024;
+        let engine = ScanEngine::load(cfg).unwrap();
+        let mut s = engine.session();
+
+        let archive = zip_of(&[("bomb.bin", &vec![0u8; 2_000_000])]);
+        let v = s.scan_bytes(Path::new("bomb.zip"), &archive);
+
+        assert!(
+            v.is_partial(),
+            "a capped archive must be reported as incompletely examined"
+        );
+        assert!(v.archive_limits.iter().any(|l| l.contains("inflates past")));
     }
 
     #[test]

@@ -47,7 +47,52 @@ pub struct Config {
     pub engines: Engines,
     pub heuristics: Heuristics,
     pub exclusions: Exclusions,
+    pub ransomware: Ransomware,
     pub updates: Updates,
+}
+
+/// Behavioural ransomware detection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Ransomware {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Plant decoy files in watched directories. Nothing legitimate modifies
+    /// them, which makes a touched decoy the highest-confidence signal there
+    /// is.
+    #[serde(default = "default_true")]
+    pub canaries: bool,
+    /// Distinct files modified within the window before it counts as a burst.
+    /// Well above ordinary build and sync activity, and never enough to alert
+    /// on its own.
+    pub burst_threshold: usize,
+    pub burst_window_secs: u64,
+    /// Entropy at or above which file contents are treated as encrypted.
+    pub entropy_threshold: f64,
+    /// Sample process I/O to name what is doing the writing.
+    #[serde(default = "default_true")]
+    pub attribute_process: bool,
+    /// Terminate the responsible process on a critical alert.
+    ///
+    /// **Off by default, deliberately.** Attribution is a strong inference,
+    /// not a certainty, and killing the wrong process loses unsaved work. This
+    /// also requires enforce mode - two switches, because the consequence of
+    /// being wrong is destructive.
+    pub terminate_on_critical: bool,
+}
+
+impl Default for Ransomware {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            canaries: true,
+            burst_threshold: 60,
+            burst_window_secs: 10,
+            entropy_threshold: 7.5,
+            attribute_process: true,
+            terminate_on_critical: false,
+        }
+    }
 }
 
 impl Default for Config {
@@ -60,6 +105,7 @@ impl Default for Config {
             engines: Engines::default(),
             heuristics: Heuristics::default(),
             exclusions: Exclusions::default(),
+            ransomware: Ransomware::default(),
             updates: Updates::default(),
         }
     }
@@ -419,6 +465,15 @@ mod tests {
         assert_eq!(cfg.mode, Mode::Enforce);
         assert!(cfg.engines.yara);
         assert_eq!(cfg.scan.timeout_ms, 5_000);
+    }
+
+    #[test]
+    fn destructive_ransomware_response_is_off_by_default() {
+        // Terminating a process on an inference is the most destructive thing
+        // Redoubt can do. It must never be on unless deliberately chosen.
+        let r = Ransomware::default();
+        assert!(r.enabled, "detection itself should be on");
+        assert!(!r.terminate_on_critical, "killing processes must be opt-in");
     }
 
     #[test]

@@ -22,7 +22,11 @@
 //! nonsense. Paths are therefore held for a short settle period and coalesced,
 //! so one copy costs one scan.
 
+pub mod process;
+pub mod ransomware;
 pub mod watcher;
+
+use ransomware::{Alert, RansomwareGuard};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{bounded, Receiver, Sender};
@@ -58,6 +62,12 @@ pub struct Counters {
     pub quarantined: AtomicU64,
     /// Enforcement was wanted but failed.
     pub quarantine_failures: AtomicU64,
+    /// Ransomware alerts raised.
+    pub ransomware_alerts: AtomicU64,
+    /// Processes terminated in response to one.
+    pub processes_terminated: AtomicU64,
+    /// Recovery-destroying tools seen starting.
+    pub recovery_tools_seen: AtomicU64,
 }
 
 impl Counters {
@@ -72,6 +82,9 @@ impl Counters {
             suspicious: g(&self.suspicious),
             quarantined: g(&self.quarantined),
             quarantine_failures: g(&self.quarantine_failures),
+            ransomware_alerts: g(&self.ransomware_alerts),
+            processes_terminated: g(&self.processes_terminated),
+            recovery_tools_seen: g(&self.recovery_tools_seen),
         }
     }
 }
@@ -87,6 +100,9 @@ pub struct CounterSnapshot {
     pub suspicious: u64,
     pub quarantined: u64,
     pub quarantine_failures: u64,
+    pub ransomware_alerts: u64,
+    pub processes_terminated: u64,
+    pub recovery_tools_seen: u64,
 }
 
 /// What the UI shows about resident protection.
@@ -101,8 +117,22 @@ pub struct Status {
     pub counters: CounterSnapshot,
     pub cache_entries: usize,
     pub cache_hit_rate: f64,
+    /// Behavioural ransomware detection.
+    pub ransomware: RansomwareStatus,
     /// Plain statement of the protection level. Never dressed up.
     pub note: String,
+}
+
+/// What the ransomware guard is doing.
+#[derive(Debug, Clone, Serialize)]
+pub struct RansomwareStatus {
+    pub enabled: bool,
+    /// Decoy files currently planted.
+    pub canaries: usize,
+    /// Terminate the responsible process on a critical alert. Requires
+    /// enforce mode as well.
+    pub will_terminate: bool,
+    pub alerts: Vec<Alert>,
 }
 
 struct Inner {
@@ -116,6 +146,11 @@ struct Inner {
     tx: Sender<PathBuf>,
     rx: Receiver<PathBuf>,
     generation: u32,
+    guard: RansomwareGuard,
+    /// Sampled continuously by `process_loop`, and shared with the ransomware
+    /// guard so attribution reads the sample from around the time of the
+    /// event rather than taking a fresh one after the fact.
+    proc_monitor: Arc<process::ProcessMonitor>,
 }
 
 /// A running (or stopped) protection instance.
@@ -124,6 +159,7 @@ pub struct Protection {
     inner: Arc<Inner>,
     watcher: Arc<Mutex<Option<watcher::Watcher>>>,
     workers: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+    proc_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 }
 
 fn now_epoch() -> u64 {
@@ -150,11 +186,14 @@ impl Protection {
                 tx,
                 rx,
                 generation,
+                guard: RansomwareGuard::new(cfg.ransomware.clone()),
+                proc_monitor: Arc::new(process::ProcessMonitor::new()),
                 engine,
                 cfg,
             }),
             watcher: Arc::new(Mutex::new(None)),
             workers: Arc::new(Mutex::new(Vec::new())),
+            proc_thread: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -201,7 +240,29 @@ impl Protection {
         .context("starting the filesystem watcher")?;
         *self.watcher.lock() = Some(w);
 
-        tracing::info!(roots = roots.len(), workers = worker_count, "resident protection started");
+        // Decoys go in after the watcher, so planting them is not itself seen
+        // as suspicious activity - and they are planted only once, because
+        // rewriting them on every start would look exactly like an attack.
+        let planted = self.inner.guard.plant_canaries(&roots);
+
+        // The guard attributes from the same continuously-sampled monitor.
+        self.inner.guard.attach_monitor(self.inner.proc_monitor.clone());
+
+        // Process polling runs on its own thread: it is the only way to see a
+        // program start without a driver, and it must not compete with the
+        // scan workers for the queue.
+        {
+            let inner = self.inner.clone();
+            *self.proc_thread.lock() =
+                Some(std::thread::spawn(move || process_loop(inner)));
+        }
+
+        tracing::info!(
+            roots = roots.len(),
+            workers = worker_count,
+            canaries = planted,
+            "resident protection started"
+        );
         Ok(())
     }
 
@@ -218,6 +279,13 @@ impl Protection {
         for h in handles {
             let _ = h.join();
         }
+        if let Some(h) = self.proc_thread.lock().take() {
+            let _ = h.join();
+        }
+
+        // Decoys are ours; do not leave them in the user's folders.
+        self.inner.guard.remove_canaries();
+
         tracing::info!("resident protection stopped");
     }
 
@@ -233,8 +301,24 @@ impl Protection {
             counters: self.inner.counters.snapshot(),
             cache_entries: cache.entries,
             cache_hit_rate: cache.hit_rate(),
+            ransomware: RansomwareStatus {
+                enabled: self.inner.cfg.ransomware.enabled,
+                canaries: self.inner.guard.canary_count(),
+                will_terminate: self.inner.cfg.ransomware.terminate_on_critical
+                    && self.inner.cfg.mode == Mode::Enforce,
+                alerts: self.inner.guard.alerts(),
+            },
             note: self.note(),
         }
+    }
+
+    /// Ransomware alerts raised so far, newest last.
+    pub fn ransomware_alerts(&self) -> Vec<Alert> {
+        self.inner.guard.alerts()
+    }
+
+    pub fn clear_ransomware_alerts(&self) {
+        self.inner.guard.clear_alerts();
     }
 
     /// An honest description of the protection level.
@@ -243,15 +327,21 @@ impl Protection {
             return "On-demand scanning only. Resident protection is not running.".to_string();
         }
         let enforcing = self.inner.cfg.mode == Mode::Enforce;
+        let canaries = self.inner.guard.canary_count();
         format!(
             "Watching {} location(s); files are scanned shortly after they change. \
-             {} Pre-execution blocking needs a filesystem minifilter, which is not built yet.",
+             {}{} Pre-execution blocking needs a filesystem minifilter, which is not built yet.",
             self.watch_roots().len(),
             if enforcing {
                 "Malicious files are quarantined."
             } else {
                 "Detections are reported only - nothing is quarantined."
-            }
+            },
+            if canaries > 0 {
+                format!(" {canaries} ransomware decoys planted.")
+            } else {
+                String::new()
+            },
         )
     }
 
@@ -298,6 +388,95 @@ fn worker_loop(inner: Arc<Inner>) {
     }
 }
 
+/// Run the behavioural checks for one path and act on any alert.
+fn check_ransomware(inner: &Arc<Inner>, path: &std::path::Path) {
+    if !inner.cfg.ransomware.enabled {
+        return;
+    }
+
+    // Only read the file when the entropy check could actually use it: a
+    // decoy or a ransom-note filename needs no contents at all.
+    let data = std::fs::metadata(path)
+        .ok()
+        .filter(|m| m.is_file() && m.len() >= 512 && m.len() <= 4 * 1024 * 1024)
+        .and_then(|_| std::fs::read(path).ok());
+
+    let Some(mut alert) = inner.guard.observe(path, data.as_deref(), now_epoch()) else {
+        return;
+    };
+
+    inner.counters.ransomware_alerts.fetch_add(1, Ordering::Relaxed);
+    tracing::error!(
+        confidence = ?alert.confidence,
+        summary = %alert.summary,
+        suspects = alert.suspects.len(),
+        "RANSOMWARE"
+    );
+    for s in &alert.signals {
+        tracing::error!(signal = %s.describe());
+    }
+
+    // Two independent switches, because being wrong here is destructive:
+    // enforcement must be on *and* termination explicitly chosen.
+    let may_terminate = inner.cfg.mode == Mode::Enforce
+        && inner.cfg.ransomware.terminate_on_critical
+        && alert.confidence == ransomware::Confidence::Critical;
+
+    if may_terminate {
+        match inner.guard.terminate_suspect(&mut alert) {
+            Ok(pid) => {
+                inner.counters.processes_terminated.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(pid, "terminated the process responsible");
+            }
+            Err(e) => tracing::error!(error = %e, "could not terminate the suspect"),
+        }
+    }
+}
+
+/// Poll for newly started processes.
+///
+/// Sampling, not interception: a program that starts and exits between two
+/// polls is never seen. The interval is short enough to catch anything that
+/// does real work, and this is stated rather than glossed over.
+fn process_loop(inner: Arc<Inner>) {
+    // Establish a baseline so every process already running is not reported as
+    // having just started.
+    inner.proc_monitor.newly_started();
+
+    while inner.running.load(Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        if !inner.running.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Sample every round so a baseline exists before anything goes wrong.
+        // Attribution after the fact is worthless: by then the culprit has
+        // usually exited.
+        inner.proc_monitor.sample();
+
+        for p in inner.proc_monitor.newly_started() {
+            // Living-off-the-land tools that destroy the ability to recover.
+            // Their presence is a signal, never a verdict: they are ordinary
+            // Windows utilities.
+            if let Some(why) = process::recovery_destroyer(&p.name) {
+                inner.counters.recovery_tools_seen.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    process = %p.name,
+                    pid = p.pid,
+                    reason = why,
+                    "a recovery-destroying tool started"
+                );
+            }
+
+            // Scan the image of anything that starts, so a known-bad binary is
+            // caught at launch rather than only when it was written.
+            if let Some(image) = &p.image {
+                let _ = inner.tx.try_send(image.clone());
+            }
+        }
+    }
+}
+
 fn handle_path(
     inner: &Arc<Inner>,
     path: &std::path::Path,
@@ -314,6 +493,12 @@ fn handle_path(
             return;
         }
     }
+
+    // Behavioural ransomware checks run on every event, including ones the
+    // verdict cache would otherwise short-circuit: an encrypted file has a new
+    // mtime and size, so it always reaches here, and the decoy check must not
+    // depend on the file being scannable.
+    check_ransomware(inner, path);
 
     let ScanOutcome::Scanned(verdict) = session.scan_path(path) else {
         return;
@@ -567,6 +752,107 @@ mod tests {
         assert!(
             f.protection.status().counters.dropped > 0,
             "a full queue must drop and count, not block"
+        );
+    }
+
+    #[test]
+    fn canaries_are_planted_on_start_and_removed_on_stop() {
+        let f = fixture("canaries", Mode::Observe);
+        let watch = f.dir.join("watch");
+
+        f.protection.start().unwrap();
+        let planted: Vec<_> = std::fs::read_dir(&watch)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(!planted.is_empty(), "no decoys were planted");
+        assert!(f.protection.status().ransomware.canaries > 0);
+
+        f.protection.stop();
+        let left: Vec<_> = std::fs::read_dir(&watch)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(left.is_empty(), "decoys were left behind: {left:?}");
+    }
+
+    #[test]
+    fn a_simulated_ransomware_run_raises_a_critical_alert() {
+        // The scenario end to end: decoys are planted, something rewrites one,
+        // and the guard reacts.
+        let f = fixture("ransomware", Mode::Observe);
+        let watch = f.dir.join("watch");
+        f.protection.start().unwrap();
+
+        let decoy = std::fs::read_dir(&watch)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .next()
+            .expect("a decoy should exist");
+
+        // "Encrypt" it.
+        std::fs::write(&decoy, b"encrypted-by-the-thing-we-are-simulating").unwrap();
+        check_ransomware(&f.protection.inner, &decoy);
+
+        let alerts = f.protection.ransomware_alerts();
+        assert_eq!(alerts.len(), 1, "a modified decoy must raise exactly one alert");
+        assert_eq!(alerts[0].confidence, ransomware::Confidence::Critical);
+        assert!(alerts[0].summary.contains("encrypting"));
+        assert_eq!(f.protection.status().counters.ransomware_alerts, 1);
+
+        f.protection.stop();
+    }
+
+    #[test]
+    fn observe_mode_never_terminates_anything() {
+        // Two switches guard termination; observe mode alone must be enough to
+        // prevent it even if the ransomware setting is on.
+        let f = fixture("no-kill", Mode::Observe);
+        let mut cfg = f.protection.inner.cfg.clone();
+        cfg.ransomware.terminate_on_critical = true;
+        assert_eq!(cfg.mode, Mode::Observe);
+
+        let engine = f.protection.inner.engine.clone();
+        let p = Protection::new(cfg, engine);
+        assert!(
+            !p.status().ransomware.will_terminate,
+            "observe mode must veto termination regardless of the ransomware setting"
+        );
+    }
+
+    #[test]
+    fn termination_requires_both_switches() {
+        let f = fixture("two-switches", Mode::Enforce);
+        let engine = f.protection.inner.engine.clone();
+
+        // Enforce mode alone is not enough.
+        let mut cfg = f.protection.inner.cfg.clone();
+        cfg.ransomware.terminate_on_critical = false;
+        let p = Protection::new(cfg.clone(), engine.clone());
+        assert!(!p.status().ransomware.will_terminate);
+
+        // Both together, and only then.
+        cfg.ransomware.terminate_on_critical = true;
+        let p = Protection::new(cfg, engine);
+        assert!(p.status().ransomware.will_terminate);
+    }
+
+    #[test]
+    fn ordinary_file_activity_raises_no_ransomware_alert() {
+        let f = fixture("quiet", Mode::Observe);
+        let watch = f.dir.join("watch");
+
+        for i in 0..40 {
+            let p = watch.join(format!("note{i}.txt"));
+            std::fs::write(&p, format!("some perfectly ordinary text, file {i}")).unwrap();
+            check_ransomware(&f.protection.inner, &p);
+        }
+        assert!(
+            f.protection.ransomware_alerts().is_empty(),
+            "writing ordinary text files must not look like ransomware"
         );
     }
 
