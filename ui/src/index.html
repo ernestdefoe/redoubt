@@ -532,6 +532,21 @@
             <dt class="opacity-50">detections</dt><dd class="tnum text-right" id="rt-detections">0</dd>
           </dl>
         </div>
+
+        <div class="rounded-box bg-base-200 mt-2 px-3 py-2.5">
+          <div class="flex items-center gap-2">
+            <span id="amsi-dot" class="status status-warning"></span>
+            <span class="text-sm font-medium">Script scanning</span>
+            <span id="amsi-state" class="badge badge-ghost badge-xs ml-auto">off</span>
+          </div>
+          <p id="amsi-note" class="mt-1 text-[11px] leading-snug opacity-55">
+            PowerShell, Office macros and .NET are not being checked.
+          </p>
+          <dl id="amsi-counters" class="mt-2 hidden grid-cols-2 gap-x-3 gap-y-0.5 text-[11px]">
+            <dt class="opacity-50">checked</dt><dd class="tnum text-right" id="amsi-requests">0</dd>
+            <dt class="opacity-50">blocked</dt><dd class="tnum text-right" id="amsi-blocked">0</dd>
+          </dl>
+        </div>
       </div>
     </aside>
   </div>

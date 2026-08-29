@@ -206,6 +206,153 @@ pub fn status() -> Installed {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// AMSI provider registration
+// ---------------------------------------------------------------------------
+
+/// Registering the AMSI provider DLL.
+///
+/// Two `HKLM` keys are needed and both require administrator rights: the COM
+/// class, and the class id listed under AMSI's own Providers key. Writing only
+/// the first produces a class that exists and is never called - which looks
+/// exactly like a provider that does not work.
+pub mod amsi {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use winreg::enums::*;
+    use winreg::RegKey;
+
+    /// Must match `redoubt_amsi::com::CLSID_REDOUBT_PROVIDER`.
+    ///
+    /// Duplicated rather than shared because the service must not depend on
+    /// the provider crate: the DLL is built for loading into other processes
+    /// and links nothing of ours.
+    pub const CLSID: &str = "{7B8E4C21-3D5A-4F19-9E6B-2C1D8A0F5E33}";
+
+    pub const DLL_NAME: &str = "redoubt_amsi.dll";
+
+    fn clsid_key() -> String {
+        format!(r"SOFTWARE\Classes\CLSID\{CLSID}")
+    }
+
+    fn providers_key() -> String {
+        format!(r"SOFTWARE\Microsoft\AMSI\Providers\{CLSID}")
+    }
+
+    /// Locate the provider DLL, preferring one beside the running binary.
+    pub fn find_dll(explicit: Option<&Path>) -> Option<PathBuf> {
+        if let Some(p) = explicit {
+            return p.is_file().then(|| p.to_path_buf());
+        }
+        let exe = std::env::current_exe().ok()?;
+        let beside = exe.with_file_name(DLL_NAME);
+        beside.is_file().then_some(beside)
+    }
+
+    /// What is currently registered.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum Registration {
+        /// Fully registered, with the DLL path AMSI will load.
+        Complete { dll: PathBuf },
+        /// The COM class exists but AMSI is not told about it, so nothing ever
+        /// calls it. Reported separately because it is indistinguishable from
+        /// "not working" without looking.
+        ClassOnly { dll: PathBuf },
+        None,
+    }
+
+    pub fn status() -> Registration {
+        let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+        let dll: Option<PathBuf> = hklm
+            .open_subkey(format!(r"{}\InprocServer32", clsid_key()))
+            .ok()
+            .and_then(|k| k.get_value::<String, _>("").ok())
+            .map(PathBuf::from);
+
+        let listed = hklm.open_subkey(providers_key()).is_ok();
+
+        match (dll, listed) {
+            (Some(dll), true) => Registration::Complete { dll },
+            (Some(dll), false) => Registration::ClassOnly { dll },
+            (None, _) => Registration::None,
+        }
+    }
+
+    fn denied(e: &std::io::Error) -> bool {
+        e.raw_os_error() == Some(5)
+    }
+
+    fn wrap(e: std::io::Error, action: &str) -> anyhow::Error {
+        if denied(&e) {
+            anyhow::anyhow!(
+                "{action} needs administrator rights. Run this from an elevated \
+                 prompt (right-click Terminal, Run as administrator)."
+            )
+        } else {
+            anyhow::anyhow!("{action} failed: {e}")
+        }
+    }
+
+    /// Register the provider so AMSI loads it.
+    pub fn install(dll: &Path) -> Result<()> {
+        if !dll.is_file() {
+            anyhow::bail!("{} does not exist", dll.display());
+        }
+        let dll_path = dll
+            .canonicalize()
+            .unwrap_or_else(|_| dll.to_path_buf())
+            .to_string_lossy()
+            // canonicalize yields a \\?\ prefix, which COM will not load.
+            .trim_start_matches(r"\\?\")
+            .to_string();
+
+        let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+
+        let (class, _) = hklm
+            .create_subkey(clsid_key())
+            .map_err(|e| wrap(e, "creating the COM class key"))?;
+        class
+            .set_value("", &"Redoubt AMSI Provider")
+            .map_err(|e| wrap(e, "naming the COM class"))?;
+
+        let (inproc, _) = hklm
+            .create_subkey(format!(r"{}\InprocServer32", clsid_key()))
+            .map_err(|e| wrap(e, "creating InprocServer32"))?;
+        inproc
+            .set_value("", &dll_path)
+            .map_err(|e| wrap(e, "setting the DLL path"))?;
+        // "Both" lets COM call the provider on whatever thread the host is on,
+        // without marshalling.
+        inproc
+            .set_value("ThreadingModel", &"Both")
+            .map_err(|e| wrap(e, "setting the threading model"))?;
+
+        // The registration that actually makes AMSI call us.
+        let (providers, _) = hklm
+            .create_subkey(providers_key())
+            .map_err(|e| wrap(e, "listing the provider with AMSI"))?;
+        providers
+            .set_value("", &"Redoubt AMSI Provider")
+            .map_err(|e| wrap(e, "naming the provider"))?;
+
+        Ok(())
+    }
+
+    /// Remove both keys. A missing key is not an error.
+    pub fn uninstall() -> Result<()> {
+        let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+        for key in [providers_key(), clsid_key()] {
+            match hklm.delete_subkey_all(&key) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(wrap(e, "removing the registration")),
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +392,31 @@ mod tests {
         let text = e.to_string();
         assert!(text.contains("administrator"), "{text}");
         assert!(text.contains("elevated"), "{text}");
+    }
+
+    #[test]
+    fn the_amsi_class_id_matches_the_provider_dll() {
+        // Two separately-built binaries agreeing by convention. If these ever
+        // diverge the registration points at a class that does not exist, and
+        // AMSI silently never calls anything.
+        assert_eq!(amsi::CLSID, "{7B8E4C21-3D5A-4F19-9E6B-2C1D8A0F5E33}");
+        assert_eq!(amsi::DLL_NAME, "redoubt_amsi.dll");
+    }
+
+    #[test]
+    fn amsi_status_answers_without_elevation() {
+        // Reading HKLM does not need admin; only writing does.
+        match amsi::status() {
+            amsi::Registration::Complete { .. }
+            | amsi::Registration::ClassOnly { .. }
+            | amsi::Registration::None => {}
+        }
+    }
+
+    #[test]
+    fn installing_a_missing_dll_is_refused_before_touching_the_registry() {
+        let err = amsi::install(std::path::Path::new(r"Z:\nope\redoubt_amsi.dll")).unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "{err}");
     }
 
     #[test]

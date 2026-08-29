@@ -229,7 +229,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
         let (h, s) = (hits.clone(), seen.clone());
 
-        let watcher = Watcher::start(&[dir.clone()], move |p| {
+        let watcher = Watcher::start(std::slice::from_ref(&dir), move |p| {
             h.fetch_add(1, Ordering::Relaxed);
             s.lock().push(p);
         })

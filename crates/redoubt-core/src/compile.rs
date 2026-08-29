@@ -115,7 +115,7 @@ impl CompileReport {
                 bytes,
             })
             .collect();
-        out.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+        out.sort_by_key(|s| std::cmp::Reverse(s.bytes));
         out
     }
 
@@ -183,6 +183,18 @@ pub struct CompileSummary {
     pub file_hashes: u64,
     pub section_hashes: u64,
     pub body_patterns: u64,
+    /// Logical signatures actually evaluated by the engine.
+    ///
+    /// `#[serde(default)]` throughout so a sidecar written by an older build
+    /// still loads: a missing field reads as zero rather than making the whole
+    /// summary unparseable, which would silently blank the coverage display.
+    #[serde(default)]
+    pub logical_rules: u64,
+    /// Logical signatures the compiler could not represent - PCRE, byte
+    /// ranges, count expressions. Carried so the interface can say how much of
+    /// the format is covered instead of implying all of it is.
+    #[serde(default)]
+    pub logical_skipped: u64,
     pub allowlisted: u64,
     pub unsupported: u64,
     pub malformed: u64,
@@ -214,6 +226,15 @@ impl CompileReport {
             file_hashes: self.index.file_hashes,
             section_hashes: self.index.section_hashes,
             body_patterns: self.index.body_patterns,
+            logical_rules: self.index.logical_rules,
+            // Everything seen and not accepted, not just the two "unsupported"
+            // reasons: a rule dropped for being too short is equally not
+            // evaluated, and counting only some of the misses would overstate
+            // coverage in exactly the direction that flatters us.
+            logical_skipped: self
+                .logical
+                .total_seen()
+                .saturating_sub(self.logical.accepted),
             allowlisted: self.index.allowlisted,
             unsupported: self.unsupported(),
             malformed: self.malformed(),

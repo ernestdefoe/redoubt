@@ -215,10 +215,15 @@ function renderStatus(s) {
     ["YARA rules", `${num(e.yara_rules)} rules`, e.yara_rules > 0],
     [
       "Logical signatures",
-      s.gaps.find((g) => g.extension === "ldb")
-        ? `${bytes(s.gaps.filter((g) => g.extension.startsWith("ld")).reduce((a, g) => a + g.bytes, 0))} not evaluated`
+      // Say what is covered *and* what is not. Reporting only the rules that
+      // compiled would imply the whole format is handled; PCRE, byte-range and
+      // count subsignatures are not, and that is most of the remainder.
+      e.logical_rules > 0
+        ? e.logical_skipped > 0
+          ? `${num(e.logical_rules)} rules · ${num(e.logical_skipped)} not evaluated`
+          : `${num(e.logical_rules)} rules`
         : "not evaluated",
-      false,
+      e.logical_rules > 0,
     ],
   ];
   $("#coverage-list").innerHTML = covered
@@ -242,6 +247,60 @@ function renderStatus(s) {
 
   renderSources(s);
   renderGaps(s.gaps);
+}
+
+/** Script scanning: the AMSI provider plus the pipe it talks to.
+ *
+ * Two independent halves, and either one missing means scripts are not being
+ * scanned. They are reported separately because "registered but no service"
+ * and "service but not registered" both look like nothing happening, and the
+ * fix is different for each.
+ */
+function renderScriptScanning(ch) {
+  const registered = !!ch?.provider_registered;
+  const listening = !!ch?.listening;
+  const active = registered && listening;
+
+  const dot = $("#amsi-dot");
+  const state = $("#amsi-state");
+  const note = $("#amsi-note");
+
+  if (active) {
+    dot.className = "status status-success";
+    state.textContent = "on";
+    state.className = "badge badge-success badge-xs ml-auto";
+    note.textContent =
+      "PowerShell, Office macros and .NET are checked before they run.";
+  } else if (registered && !listening) {
+    dot.className = "status status-warning";
+    state.textContent = "no service";
+    state.className = "badge badge-warning badge-xs ml-auto";
+    note.textContent =
+      "The provider is registered but has nothing to ask. Start real-time protection.";
+  } else if (!registered && listening) {
+    dot.className = "status status-warning";
+    state.textContent = "not registered";
+    state.className = "badge badge-warning badge-xs ml-auto";
+    note.textContent =
+      "Windows has not been told about the provider, so it is never called. " +
+      "From an elevated prompt: redoubtd amsi-install";
+  } else {
+    dot.className = "status status-warning";
+    state.textContent = "off";
+    state.className = "badge badge-ghost badge-xs ml-auto";
+    note.textContent =
+      "PowerShell, Office macros and .NET are not being checked.";
+  }
+
+  const counters = $("#amsi-counters");
+  counters.classList.toggle("hidden", !active);
+  counters.classList.toggle("grid", active);
+  if (active) {
+    $("#amsi-requests").textContent = num(ch.requests ?? 0);
+    const blocked = ch.malicious ?? 0;
+    $("#amsi-blocked").textContent = num(blocked);
+    $("#amsi-blocked").className = `tnum text-right${blocked > 0 ? " text-error" : ""}`;
+  }
 }
 
 /** The ransomware banner.
@@ -333,6 +392,8 @@ function renderRealtime(rt) {
     $("#rt-detections").textContent = num(detections);
     $("#rt-detections").className = `tnum text-right${detections > 0 ? " text-error" : ""}`;
   }
+
+  renderScriptScanning(rt.scan_channel);
 
   // Poll while running so the counters move; stop entirely when it is off, so
   // an idle page makes no requests at all.

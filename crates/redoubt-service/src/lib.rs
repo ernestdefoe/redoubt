@@ -23,6 +23,7 @@
 //! so one copy costs one scan.
 
 pub mod install;
+pub mod ipc;
 pub mod process;
 pub mod ransomware;
 pub mod watcher;
@@ -120,8 +121,27 @@ pub struct Status {
     pub cache_hit_rate: f64,
     /// Behavioural ransomware detection.
     pub ransomware: RansomwareStatus,
+    /// The scan channel the AMSI provider talks to.
+    pub scan_channel: ScanChannelStatus,
     /// Plain statement of the protection level. Never dressed up.
     pub note: String,
+}
+
+/// The named-pipe scan channel.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanChannelStatus {
+    pub listening: bool,
+    /// Whether the AMSI provider is registered with Windows.
+    ///
+    /// Reported separately from `listening` because the two fail in opposite
+    /// directions and are indistinguishable from outside: a pipe listening
+    /// that nothing ever calls, and a registered provider with no service to
+    /// ask. Either one on its own means scripts are not being scanned.
+    pub provider_registered: bool,
+    pub pipe: String,
+    pub requests: u64,
+    pub malicious: u64,
+    pub suspicious: u64,
 }
 
 /// What the ransomware guard is doing.
@@ -161,6 +181,9 @@ pub struct Protection {
     watcher: Arc<Mutex<Option<watcher::Watcher>>>,
     workers: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
     proc_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+    /// Serves scan requests from the AMSI provider, which cannot hold an
+    /// engine of its own - it is loaded into every AMSI host on the machine.
+    scan_server: Arc<Mutex<Option<ipc::ScanServer>>>,
 }
 
 fn now_epoch() -> u64 {
@@ -195,6 +218,7 @@ impl Protection {
             watcher: Arc::new(Mutex::new(None)),
             workers: Arc::new(Mutex::new(Vec::new())),
             proc_thread: Arc::new(Mutex::new(None)),
+            scan_server: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -258,6 +282,14 @@ impl Protection {
                 Some(std::thread::spawn(move || process_loop(inner)));
         }
 
+        // The scan channel. A failure here must not stop protection: file
+        // watching is the primary defence and works without it; only script
+        // scanning is lost.
+        match ipc::ScanServer::start(self.inner.engine.clone()) {
+            Ok(server) => *self.scan_server.lock() = Some(server),
+            Err(e) => tracing::error!(error = %e, "scan channel unavailable"),
+        }
+
         tracing::info!(
             roots = roots.len(),
             workers = worker_count,
@@ -282,6 +314,9 @@ impl Protection {
         }
         if let Some(h) = self.proc_thread.lock().take() {
             let _ = h.join();
+        }
+        if let Some(mut server) = self.scan_server.lock().take() {
+            server.stop();
         }
 
         // Decoys are ours; do not leave them in the user's folders.
@@ -308,6 +343,30 @@ impl Protection {
                 will_terminate: self.inner.cfg.ransomware.terminate_on_critical
                     && self.inner.cfg.mode == Mode::Enforce,
                 alerts: self.inner.guard.alerts(),
+            },
+            scan_channel: {
+                let server = self.scan_server.lock();
+                let c = server.as_ref().map(|s| s.counters());
+                ScanChannelStatus {
+                    listening: server.is_some(),
+                    provider_registered: matches!(
+                        install::amsi::status(),
+                        install::amsi::Registration::Complete { .. }
+                    ),
+                    pipe: ipc::PIPE_NAME.to_string(),
+                    requests: c
+                        .as_ref()
+                        .map(|c| c.requests.load(Ordering::Relaxed))
+                        .unwrap_or(0),
+                    malicious: c
+                        .as_ref()
+                        .map(|c| c.malicious.load(Ordering::Relaxed))
+                        .unwrap_or(0),
+                    suspicious: c
+                        .as_ref()
+                        .map(|c| c.suspicious.load(Ordering::Relaxed))
+                        .unwrap_or(0),
+                }
             },
             note: self.note(),
         }
@@ -575,9 +634,41 @@ mod tests {
 
     const SAMPLE: &[u8] = b"REDOUBT-REALTIME-TEST-SAMPLE-not-real-malware";
 
+    /// Serialises the tests that bind the scan pipe.
+    ///
+    /// The pipe name is deliberately fixed - the AMSI provider is loaded into
+    /// processes that know nothing about Redoubt and has no configuration - so
+    /// it is a single global resource. Two tests binding it at once will serve
+    /// each other's clients, which is a property of the harness rather than of
+    /// the code.
+    static PIPE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn pipe_guard() -> std::sync::MutexGuard<'static, ()> {
+        PIPE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Connect to the scan pipe, waiting for the accept loop to come up.
+    fn connect_to_pipe() -> std::fs::File {
+        for _ in 0..100 {
+            if let Ok(c) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(ipc::PIPE_NAME)
+            {
+                return c;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+        panic!("the scan pipe never accepted a connection");
+    }
+
     struct Fixture {
         dir: PathBuf,
         protection: Protection,
+        /// Held for the fixture's lifetime. Starting protection binds the scan
+        /// pipe, whose name is fixed by design, so only one fixture may be
+        /// running at a time.
+        _pipe: std::sync::MutexGuard<'static, ()>,
     }
 
     impl Drop for Fixture {
@@ -587,6 +678,9 @@ mod tests {
         }
     }
 
+    // Written field-by-field on purpose: it names exactly what the fixture
+    // changes from the default, which a struct-update expression buries.
+    #[allow(clippy::field_reassign_with_default)]
     fn fixture(tag: &str, mode: Mode) -> Fixture {
         let dir = std::env::temp_dir().join(format!("redoubt-rt-{tag}-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
@@ -617,7 +711,7 @@ mod tests {
         cfg.realtime.watch_paths = vec![dir.join("watch")];
 
         let engine = Arc::new(ScanEngine::load(cfg.clone()).unwrap());
-        Fixture { dir, protection: Protection::new(cfg, engine) }
+        Fixture { dir, protection: Protection::new(cfg, engine), _pipe: pipe_guard() }
     }
 
     #[test]
@@ -855,6 +949,61 @@ mod tests {
             f.protection.ransomware_alerts().is_empty(),
             "writing ordinary text files must not look like ransomware"
         );
+    }
+
+    #[test]
+    fn the_scan_channel_answers_over_a_real_pipe() {
+        // The AMSI provider is a separate DLL in a foreign process, so the
+        // only meaningful test of this path is an actual pipe round-trip.
+        use std::io::{Read, Write};
+
+        let f = fixture("ipc", Mode::Observe);
+        f.protection.start().unwrap();
+        assert!(f.protection.status().scan_channel.listening);
+
+        let mut client = connect_to_pipe();
+
+        // SAMPLE is in the fixture index, so this must come back malicious.
+        client.write_all(&ipc::encode_request(SAMPLE)).unwrap();
+        client.flush().unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = client.read(&mut buf).unwrap();
+        let (verdict, name) = ipc::decode_response(&buf[..n]).expect("a decodable response");
+
+        assert_eq!(verdict, ipc::VERDICT_MALICIOUS);
+        assert_eq!(name, "Redoubt.Test.RealtimeSample");
+        assert_eq!(f.protection.status().scan_channel.malicious, 1);
+
+        f.protection.stop();
+    }
+
+    #[test]
+    fn the_scan_channel_reports_clean_content_as_clean() {
+        use std::io::{Read, Write};
+
+        let f = fixture("ipc-clean", Mode::Observe);
+        f.protection.start().unwrap();
+
+        let mut client = connect_to_pipe();
+
+        client
+            .write_all(&ipc::encode_request(b"Write-Host 'an ordinary script'"))
+            .unwrap();
+        client.flush().unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = client.read(&mut buf).unwrap();
+        let (verdict, _) = ipc::decode_response(&buf[..n]).unwrap();
+        assert_eq!(verdict, ipc::VERDICT_CLEAN);
+
+        f.protection.stop();
+    }
+
+    #[test]
+    fn the_scan_channel_is_not_listening_while_stopped() {
+        let f = fixture("ipc-off", Mode::Observe);
+        assert!(!f.protection.status().scan_channel.listening);
     }
 
     #[test]

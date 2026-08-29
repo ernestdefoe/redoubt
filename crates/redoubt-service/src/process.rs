@@ -116,7 +116,7 @@ fn median(values: impl Iterator<Item = f64>) -> f64 {
     }
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = v.len() / 2;
-    if v.len() % 2 == 0 {
+    if v.len().is_multiple_of(2) {
         (v[mid - 1] + v[mid]) / 2.0
     } else {
         v[mid]
@@ -896,7 +896,7 @@ mod tests {
             .find(|p| p.pid == std::process::id())
             .expect("our own process should be present");
         let age = me.age_secs.expect("we can always read our own creation time");
-        assert!(age >= 0.0 && age < 86_400.0, "implausible age {age}");
+        assert!((0.0..86_400.0).contains(&age), "implausible age {age}");
     }
 
     #[test]

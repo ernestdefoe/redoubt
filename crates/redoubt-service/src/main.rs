@@ -33,6 +33,13 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some("status") => cmd_status(),
+        Some("amsi-install") => cmd_amsi_install(args.get(1).map(String::as_str)),
+        Some("amsi-uninstall") => {
+            install::amsi::uninstall()?;
+            println!("Removed the Redoubt AMSI provider registration.");
+            Ok(())
+        }
+        Some("amsi-status") => cmd_amsi_status(),
         Some("--help" | "-h" | "help") => {
             print_help();
             Ok(())
@@ -56,6 +63,10 @@ fn print_help() {
          \x20 redoubtd uninstall      remove the service (needs admin)\n\
          \x20 redoubtd start|stop     control the installed service (needs admin)\n\
          \x20 redoubtd status         report whether the service is installed\n\
+         \n\
+         \x20 redoubtd amsi-install [DLL]   register the AMSI script provider (needs admin)\n\
+         \x20 redoubtd amsi-uninstall       remove the AMSI provider (needs admin)\n\
+         \x20 redoubtd amsi-status          report the AMSI provider registration\n\
          \n\
          Configuration lives at %ProgramData%\\Redoubt\\config.toml."
     );
@@ -95,6 +106,58 @@ fn cmd_status() -> Result<()> {
         install::Installed::Unknown(e) => {
             println!("service   could not be determined");
             println!("reason    {e}");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_amsi_install(explicit: Option<&str>) -> Result<()> {
+    let path = explicit.map(std::path::PathBuf::from);
+    let dll = install::amsi::find_dll(path.as_deref()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not find {}. It is built alongside redoubtd; pass its path \
+             explicitly if it lives somewhere else:\n  redoubtd amsi-install <path>",
+            install::amsi::DLL_NAME
+        )
+    })?;
+
+    install::amsi::install(&dll)?;
+    println!("Registered the Redoubt AMSI provider.");
+    println!("  dll    {}", dll.display());
+    println!("  clsid  {}", install::amsi::CLSID);
+    // Both of these surprise people, so say them rather than let them be
+    // discovered as "the provider does not work".
+    println!(
+        "\nAMSI hosts load providers when they start, so PowerShell windows and Office \
+         applications that are already open will not use it until they are restarted."
+    );
+    println!(
+        "\nScript scanning needs the Redoubt service running: the provider holds no \
+         engine of its own and asks the service for every verdict."
+    );
+    Ok(())
+}
+
+fn cmd_amsi_status() -> Result<()> {
+    match install::amsi::status() {
+        install::amsi::Registration::Complete { dll } => {
+            println!("amsi provider  registered");
+            println!("dll            {}", dll.display());
+            if !dll.is_file() {
+                println!("\nWARNING: that file no longer exists, so AMSI cannot load it.");
+            }
+        }
+        install::amsi::Registration::ClassOnly { dll } => {
+            println!("amsi provider  INCOMPLETE");
+            println!("dll            {}", dll.display());
+            println!(
+                "\nThe COM class exists but AMSI has not been told about it, so nothing \
+                 ever calls it. Re-run from an elevated prompt:  redoubtd amsi-install"
+            );
+        }
+        install::amsi::Registration::None => {
+            println!("amsi provider  not registered");
+            println!("\nRegister from an elevated prompt:  redoubtd amsi-install");
         }
     }
     Ok(())

@@ -203,8 +203,8 @@ fn run_optimize(cmd: OptimizeCommand) -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<22} {:>11} {:>9}  {:<8} {}",
-                "CATEGORY", "SIZE", "FILES", "SAFETY", "ID"
+                "{:<22} {:>11} {:>9}  {:<8} ID",
+                "CATEGORY", "SIZE", "FILES", "SAFETY"
             );
             let mut total = 0u64;
             for r in &results {
@@ -295,7 +295,7 @@ fn run_optimize(cmd: OptimizeCommand) -> Result<()> {
             let entries = startup::entries();
             let on = entries.iter().filter(|e| e.enabled).count();
             println!("{on} of {} enabled\n", entries.len());
-            println!("{:<4} {:<30} {:<28} {}", "ON", "PROGRAM", "SOURCE", "ID");
+            println!("{:<4} {:<30} {:<28} ID", "ON", "PROGRAM", "SOURCE");
             for e in &entries {
                 println!(
                     "{:<4} {:<30} {:<28} {}",
@@ -538,7 +538,7 @@ pub fn commas(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);

@@ -1,0 +1,29 @@
+[package]
+name = "redoubt-amsi"
+description = "Redoubt AMSI provider: pre-execution scanning for scripts and macros."
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+
+[lib]
+name = "redoubt_amsi"
+# A COM in-process server. Loaded into every AMSI host on the machine, so it
+# deliberately depends on almost nothing: no engine, no signature index, no
+# async runtime. It sends bytes to the Redoubt service and returns a verdict.
+# rlib alongside cdylib so the COM plumbing can be unit-tested;
+# a cdylib alone produces no test harness.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_LibraryLoader",
+    "Win32_Security",
+] }

@@ -217,6 +217,13 @@ fn status_json(app: &App) -> serde_json::Value {
     let index_path = cfg.paths.signatures.join("redoubt.sigidx");
     let index_bytes = std::fs::metadata(&index_path).map(|m| m.len()).unwrap_or(0);
 
+    // How much of the logical-signature format went unrepresented. Lives in
+    // the compile sidecar rather than the index, because a rule that could not
+    // be compiled leaves nothing behind in the index to count.
+    let logical_skipped = redoubt_core::compile::CompileSummary::load_beside(&index_path)
+        .map(|s| s.logical_skipped)
+        .unwrap_or(0);
+
     let engine = match app.engine() {
         Some(e) => {
             let s = e.stats();
@@ -227,6 +234,7 @@ fn status_json(app: &App) -> serde_json::Value {
                 "section_hashes": s.section_hashes,
                 "body_patterns": s.body_patterns,
                 "logical_rules": s.logical_rules,
+                "logical_skipped": logical_skipped,
                 "allowlisted": s.allowlisted,
                 "yara_rules": s.yara_rules,
                 "index_bytes": index_bytes,
@@ -236,7 +244,8 @@ fn status_json(app: &App) -> serde_json::Value {
         None => json!({
             "loaded": false,
             "db_version": 0, "file_hashes": 0, "section_hashes": 0,
-            "body_patterns": 0, "allowlisted": 0, "yara_rules": 0,
+            "body_patterns": 0, "logical_rules": 0, "logical_skipped": 0,
+            "allowlisted": 0, "yara_rules": 0,
             "index_bytes": 0, "built_epoch": 0,
         }),
     };

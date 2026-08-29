@@ -244,7 +244,7 @@ pub fn measure(category: &Category) -> Measurement {
 /// Measure every applicable category.
 pub fn analyze() -> Vec<Measurement> {
     let mut out: Vec<Measurement> = categories().iter().map(measure).collect();
-    out.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    out.sort_by_key(|m| std::cmp::Reverse(m.bytes));
     out
 }
 

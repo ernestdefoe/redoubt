@@ -592,7 +592,7 @@ mod tests {
         // protected when it was only unreachable.
         let dir = temp("visible");
         let g = guard();
-        g.plant_canaries(&[dir.clone()]);
+        g.plant_canaries(std::slice::from_ref(&dir));
 
         let path = dir.join(CANARY_NAMES[0]);
         // The check that matters: an ordinary truncating write must succeed,
@@ -619,7 +619,7 @@ mod tests {
         let dir = temp("plant");
         let g = guard();
 
-        let n = g.plant_canaries(&[dir.clone()]);
+        let n = g.plant_canaries(std::slice::from_ref(&dir));
         assert_eq!(n, CANARY_NAMES.len());
         for name in CANARY_NAMES {
             assert!(dir.join(name).is_file(), "{name} was not planted");
@@ -638,13 +638,13 @@ mod tests {
         // indistinguishable from an attack.
         let dir = temp("replant");
         let g = guard();
-        g.plant_canaries(&[dir.clone()]);
+        g.plant_canaries(std::slice::from_ref(&dir));
 
         let path = dir.join(CANARY_NAMES[0]);
         let before = std::fs::metadata(&path).unwrap().len();
 
         let g2 = guard();
-        g2.plant_canaries(&[dir.clone()]);
+        g2.plant_canaries(std::slice::from_ref(&dir));
         assert_eq!(std::fs::metadata(&path).unwrap().len(), before);
 
         g.remove_canaries();
@@ -655,7 +655,7 @@ mod tests {
     fn a_modified_canary_raises_a_critical_alert_on_its_own() {
         let dir = temp("canary-mod");
         let g = guard();
-        g.plant_canaries(&[dir.clone()]);
+        g.plant_canaries(std::slice::from_ref(&dir));
 
         let path = dir.join(CANARY_NAMES[0]);
         std::fs::write(&path, b"encrypted-by-something").unwrap();
@@ -674,7 +674,7 @@ mod tests {
     fn a_deleted_canary_also_alerts() {
         let dir = temp("canary-del");
         let g = guard();
-        g.plant_canaries(&[dir.clone()]);
+        g.plant_canaries(std::slice::from_ref(&dir));
         let path = dir.join(CANARY_NAMES[0]);
         std::fs::remove_file(&path).unwrap();
 
@@ -689,7 +689,7 @@ mod tests {
     fn an_untouched_canary_is_silent() {
         let dir = temp("canary-quiet");
         let g = guard();
-        g.plant_canaries(&[dir.clone()]);
+        g.plant_canaries(std::slice::from_ref(&dir));
         let path = dir.join(CANARY_NAMES[0]);
 
         assert!(

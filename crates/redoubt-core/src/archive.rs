@@ -501,7 +501,7 @@ mod tests {
         // A signature near the start of an oversized entry must still be
         // reachable: capping is about bounding work, not giving up.
         let mut payload = b"REDOUBT-MARKER-AT-THE-START".to_vec();
-        payload.extend(std::iter::repeat(0u8).take(500_000));
+        payload.extend(std::iter::repeat_n(0u8, 500_000));
         let data = zip_of(&[("big.bin", &payload)]);
 
         let limits = Limits { max_entry_bytes: 1024, ..Default::default() };
@@ -546,6 +546,9 @@ mod tests {
         assert!(e.is_complete(), "a non-archive is not an incomplete extraction");
     }
 
+    // Written field-by-field on purpose: it names exactly what this test
+    // changes from the default, which a struct-update expression buries.
+    #[allow(clippy::field_reassign_with_default)]
     #[test]
     fn limits_come_from_the_scan_config() {
         let mut scan = crate::config::ScanLimits::default();

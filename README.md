@@ -29,11 +29,12 @@ anything until you explicitly turn enforcement on.
 | Desktop interface | **Working** |
 | Disk cleanup + startup manager | **Working** |
 | Windows service registration | **Working** — `redoubtd install` |
-| AMSI provider (script blocking) | Not built |
+| Named-pipe scan channel | **Working** — one engine, many hosts |
+| AMSI provider (script blocking) | **Working** — `redoubtd amsi-install` |
 | Filesystem minifilter (pre-execution blocking) | Not built |
 | Network C2 blocking | Not built |
 
-293 tests.
+327 tests.
 
 ---
 
@@ -89,6 +90,49 @@ candidate: one process clearly ahead of the runner-up on both anomaly and
 volume. If two are plausible, nothing is terminated and the alert says so.
 It also requires enforce mode **and** an explicitly enabled setting that is off
 by default — two switches, because being wrong here is destructive.
+
+## Script scanning (AMSI)
+
+Windows' Antimalware Scan Interface hands a security product the *deobfuscated*
+text of a script immediately before it runs — PowerShell (including
+`Invoke-Expression` and every layer of an encoded command), VBScript, JScript,
+Office VBA macros, WMI, and .NET assemblies loaded from memory. It is the one
+pre-execution hook available without a kernel driver, and it is the only place
+Redoubt can stop something *before* it happens rather than after.
+
+`crates/redoubt-amsi` is a COM in-process server that Windows loads into every
+script host. Three properties follow from living inside somebody else's process:
+
+- **It holds no engine.** The index is hundreds of megabytes; a copy in every
+  PowerShell window would be ruinous. Content goes down a named pipe
+  (`\\.\pipe\Redoubt.Scan`) to the service, which owns the one engine on the
+  machine.
+- **It never panics.** Unwinding into a foreign C++ frame is undefined
+  behaviour, so every COM entry point is wrapped in `catch_unwind`.
+- **It fails open.** No service, a timeout, a reply it does not understand — all
+  yield `AMSI_RESULT_NOT_DETECTED` and the content runs. A provider that blocks
+  every script when its own service is down does not fail safe; it breaks the
+  machine and gets itself uninstalled. The whole exchange is bounded at 2s.
+
+`suspicious` deliberately does not block. Heuristics are wrong often enough that
+blocking on them would stop legitimate scripts, so only a signature match does.
+
+Registering it needs administrator rights, because it writes two `HKLM` keys —
+the COM class, and the class id listed under `SOFTWARE\Microsoft\AMSI\Providers`.
+Writing only the first produces a provider that exists and is never called,
+which is indistinguishable from one that does not work, so the interface reports
+the two halves separately.
+
+```
+redoubtd amsi-install      # from an elevated prompt
+redoubtd amsi-status
+redoubtd amsi-uninstall
+```
+
+AMSI hosts load providers at start-up, so PowerShell windows and Office
+applications already open keep running without it until they are restarted.
+
+---
 
 ## Real-time protection
 
@@ -207,16 +251,17 @@ enforceable regardless of mode.
 Stated plainly, because a scanner that quietly covers less than it claims is
 worse than one that admits what it misses.
 
-- **Half of the logical signatures are still unusable.** 51% of ClamAV's
-  273,000 `.ldb` rules use only literal patterns and plain `&`/`|`; the rest
-  need PCRE subsignatures, byte ranges or match-count operators. Of the
-  supportable half, the default length floor keeps 48,931 — raise coverage
-  with `scan.min_logical_pattern_bytes = 4` at a cost of ~200 MB resident.
+- **Most logical signatures are still unusable.** 48,931 of ClamAV's 322,283
+  `.ldb` rules are evaluated — 15%. The rest need PCRE subsignatures, byte
+  ranges or match-count operators, or fall under the default length floor.
+  Raise coverage with `scan.min_logical_pattern_bytes = 4` at a cost of
+  ~200 MB resident. The interface states both numbers rather than only the
+  one that flatters it.
 - **`.ndb` patterns using wildcards are skipped.** Only literal patterns of 16+
   bytes are indexed; `redoubt db update` reports how many were refused.
-- **No pre-execution blocking.** That needs a filesystem minifilter. Script
-  blocking needs an AMSI provider. Neither is built, so a malicious script run
-  from PowerShell is not stopped before it executes.
+- **No pre-execution blocking for files.** That needs a filesystem minifilter,
+  which needs the WDK; a malicious *executable* is caught when it is written,
+  not when it is launched. Scripts are a different matter — see the AMSI section above.
 - **No network blocking.** C2 callbacks and exfiltration are not intercepted.
 - **Ransomware attribution cannot see which process wrote which file.** It is
   inferred from I/O behaviour and can name nobody.
@@ -226,7 +271,6 @@ worse than one that admits what it misses.
 - **`.cbc` bytecode is out of scope permanently** — it needs ClamAV's VM.
 - **CVD digital signatures are not verified.** Integrity rests on HTTPS from the
   official mirror.
-- **No archive expansion yet.** `scan.archive_depth` exists but is not wired up.
 `redoubt db update` prints a per-format breakdown of everything it could not
 index, with an explanation of each. The interface shows the same thing under
 Signatures → Not indexed.
@@ -266,6 +310,7 @@ crates/
                      quarantine, verdict cache
   redoubt-optimize/  disk cleanup and startup entries
   redoubt-service/   resident protection; the `redoubtd` binary
+  redoubt-amsi/      the AMSI provider DLL loaded into script hosts
   redoubt-ui/        local HTTP server and JSON API
   redoubt-cli/       the `redoubt` binary
 ui/                  the interface (Tailwind 4 + daisyUI 5)

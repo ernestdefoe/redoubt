@@ -290,9 +290,9 @@ mod tests {
             out.extend_from_slice(&header);
             out.extend_from_slice(body.as_bytes());
             let pad = (512 - body.len() % 512) % 512;
-            out.extend(std::iter::repeat(0u8).take(pad));
+            out.extend(std::iter::repeat_n(0u8, pad));
         }
-        out.extend(std::iter::repeat(0u8).take(1024)); // end-of-archive
+        out.extend(std::iter::repeat_n(0u8, 1024)); // end-of-archive
 
         let mut gz = GzEncoder::new(Vec::new(), Compression::fast());
         gz.write_all(&out).unwrap();

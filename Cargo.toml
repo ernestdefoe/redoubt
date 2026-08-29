@@ -4,6 +4,7 @@ members = [
     "crates/redoubt-core",
     "crates/redoubt-cli",
     "crates/redoubt-ui",
+    "crates/redoubt-amsi",
     "crates/redoubt-optimize",
     "crates/redoubt-service",
 ]

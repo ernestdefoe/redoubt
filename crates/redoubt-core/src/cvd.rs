@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn detects_gzip_magic() {
         assert!(payload_is_gzip(&[0x1f, 0x8b]));
-        assert!(!payload_is_gzip(&[b'u', b's']));   // plain tar (ustar)
+        assert!(!payload_is_gzip(b"us"));   // plain tar (ustar)
         assert!(!payload_is_gzip(&[0x1f]));          // too short to tell
     }
 
